@@ -561,7 +561,21 @@ class GPUModelRunner(
             elif self.speculative_config.use_gemma4_mtp():
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
-                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                if self.speculative_config.use_ddtree():
+                    # Local extension: DDTree builds a top-k draft tree on
+                    # top of the DFlash drafter. Imported lazily so the
+                    # off-path never touches this module.
+                    from vllm.v1.spec_decode.ddtree_proposer import (
+                        DDTreeProposer,
+                    )
+
+                    self.drafter = DDTreeProposer(
+                        self.vllm_config, self.device, self
+                    )
+                else:
+                    self.drafter = DFlashProposer(
+                        self.vllm_config, self.device, self
+                    )
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)

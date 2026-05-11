@@ -150,6 +150,17 @@ class SpeculativeConfig:
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
 
+    # DDTree (Diffusion Draft Tree) — extends DFlash with a top-k draft
+    # tree built from per-position draft logits. Default is off; when off,
+    # the runtime path is identical to upstream DFlash.
+    ddtree_enabled: bool = False
+    """Enable DDTree on top of the DFlash drafter. Only valid when
+    ``method='dflash'``. Default ``False``."""
+    ddtree_budget: int | None = Field(default=None, ge=1)
+    """Maximum number of tree nodes (besides the root) the DDTree drafter
+    is allowed to expand per draft step. When ``None``, defaults to
+    ``num_speculative_tokens``."""
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""
@@ -1061,6 +1072,10 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_ddtree(self) -> bool:
+        """DDTree is an extension of DFlash; requires method=='dflash'."""
+        return self.use_dflash() and self.ddtree_enabled
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
