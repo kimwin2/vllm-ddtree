@@ -160,6 +160,15 @@ class SpeculativeConfig:
     """Maximum number of tree nodes (besides the root) the DDTree drafter
     is allowed to expand per draft step. When ``None``, defaults to
     ``num_speculative_tokens``."""
+    ddtree_verify_tree: bool = False
+    """Enable DDTree's target-side tree verification path. When ``True``,
+    the target verifies a tree of ``1 + ddtree_budget`` query tokens per
+    request (instead of the linear ``1 + num_speculative_tokens``), with
+    a 2D visibility mask. The DFlash drafter continues to operate on its
+    native ``1 + 15 = 16`` slot window internally (its training window),
+    and the tree is expanded externally from its 15 logits.
+    Requires ``ddtree_enabled=true`` and
+    ``ddtree_budget == num_speculative_tokens``. Default ``False``."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -1076,6 +1085,28 @@ class SpeculativeConfig:
     def use_ddtree(self) -> bool:
         """DDTree is an extension of DFlash; requires method=='dflash'."""
         return self.use_dflash() and self.ddtree_enabled
+
+    def use_ddtree_verify_tree(self) -> bool:
+        """Whether the target verify pass should consume a tree mask.
+
+        Implies ``use_ddtree()``. Requires
+        ``ddtree_budget == num_speculative_tokens`` so that the
+        target's per-request query length (``1 + num_speculative_tokens``)
+        exactly matches the tree size (``1 + ddtree_budget``).
+        """
+        if not (self.use_ddtree() and self.ddtree_verify_tree):
+            return False
+        budget = self.ddtree_budget
+        if budget is None:
+            budget = self.num_speculative_tokens
+        if budget != self.num_speculative_tokens:
+            raise ValueError(
+                "ddtree_verify_tree=true requires "
+                "ddtree_budget == num_speculative_tokens, got "
+                f"ddtree_budget={budget}, "
+                f"num_speculative_tokens={self.num_speculative_tokens}"
+            )
+        return True
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

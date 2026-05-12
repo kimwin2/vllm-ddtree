@@ -109,6 +109,14 @@ class DDTreeProposer(DFlashProposer):
     # Emit an aggregated INFO log line once this many samples accumulate.
     _DDTREE_LOG_FLUSH_AT: int = 25
 
+    # The DFlash drafter is trained at a fixed block_size (gemma-4 dflash
+    # uses block_size=16 → 15 mask positions). When ``ddtree_verify_tree``
+    # is on, we run the drafter with this many internal slots regardless
+    # of ``num_speculative_tokens``, so its forward stays in its trained
+    # regime. The tree (``ddtree_budget`` nodes) is expanded externally
+    # from the 15 logits this forward produces.
+    DFLASH_DRAFT_HORIZON: int = 15
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -127,8 +135,23 @@ class DDTreeProposer(DFlashProposer):
         if budget is None or budget <= 0:
             budget = self.num_speculative_tokens
         self.ddtree_budget: int = int(budget)
-        # S3 will use these; S1/S2 only measure.
-        self._ddtree_verify_enabled: bool = False
+
+        # S3c-1: target-side tree verify flag. When True, ``propose`` runs
+        # dflash drafter with the fixed ``DFLASH_DRAFT_HORIZON`` window
+        # internally and returns ``ddtree_budget`` tree-node tokens
+        # (= num_speculative_tokens) by tree expansion of the drafter's
+        # 15 logits. Default False keeps the dflash output path intact.
+        self._ddtree_verify_enabled: bool = bool(
+            getattr(spec_cfg, "ddtree_verify_tree", False)
+        )
+        if self._ddtree_verify_enabled:
+            if self.ddtree_budget != self.num_speculative_tokens:
+                raise ValueError(
+                    "ddtree_verify_tree=true requires "
+                    "ddtree_budget == num_speculative_tokens, got "
+                    f"ddtree_budget={self.ddtree_budget}, "
+                    f"num_speculative_tokens={self.num_speculative_tokens}"
+                )
 
         # The base proposer accepts ``runner`` but doesn't store it. We
         # need it for the S2 target-side capability probe to reach
@@ -155,15 +178,29 @@ class DDTreeProposer(DFlashProposer):
         # path; S3c will plumb it to the target verify metadata.
         self._ddtree_pending_mask: torch.Tensor | None = None
 
+        stage_tag = "S1+S2+S3b+S3c-1" if self._ddtree_verify_enabled else "S1+S2+S3b"
         logger.info(
             "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
-            "verify=tree:%s). S1+S2+S3b path active: real-logits tree "
-            "stats + backend probe at init + per-batch mask stash "
-            "every %d sampled batches; target verify path unchanged.",
+            "verify=tree:%s, dflash_draft_horizon=%d). %s path active. "
+            "verify_tree=%s: %s",
             self.ddtree_budget,
             self.num_speculative_tokens,
             self._ddtree_verify_enabled,
-            self._DDTREE_LOG_FLUSH_AT,
+            self.DFLASH_DRAFT_HORIZON,
+            stage_tag,
+            self._ddtree_verify_enabled,
+            (
+                "drafter runs at horizon=15 internally; propose() returns "
+                "budget tree-node tokens. NOTE: in S3c-1 the runner still "
+                "verifies these tokens with non-causal attention (no tree "
+                "mask). Output tokens will differ from dflash and may not "
+                "be coherent until S3c-2/3 land."
+                if self._ddtree_verify_enabled
+                else "drafter and output both at num_speculative_tokens; "
+                "real-logits tree stats logged every "
+                f"{self._DDTREE_LOG_FLUSH_AT} sampled batches; target "
+                "verify path unchanged."
+            ),
         )
 
     @override
@@ -429,6 +466,27 @@ class DDTreeProposer(DFlashProposer):
     ) -> torch.Tensor:
         self._ddtree_last_logits = None
 
+        if self._ddtree_verify_enabled:
+            # S3c-1: drafter forward uses dflash's native horizon (16 slots)
+            # internally; we temporarily reduce self.num_speculative_tokens
+            # so the inherited DFlash setup builds a 1+15 query layout.
+            # After super().propose returns, we discard its linear-tokens
+            # result and produce a tree of `budget` nodes from the 15
+            # logits captured during _greedy_sample.
+            return self._propose_with_tree_expansion(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                common_attn_metadata=common_attn_metadata,
+                sampling_metadata=sampling_metadata,
+                mm_embed_inputs=mm_embed_inputs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mappings=slot_mappings,
+            )
+
+        # S1+S2+S3b path (verify_tree off): unchanged from before.
         draft_token_ids = super().propose(
             target_token_ids=target_token_ids,
             target_positions=target_positions,
@@ -455,6 +513,173 @@ class DDTreeProposer(DFlashProposer):
         self._ddtree_last_logits = None
 
         return draft_token_ids
+
+    def _propose_with_tree_expansion(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: "CommonAttentionMetadata",
+        sampling_metadata: "SamplingMetadata",
+        mm_embed_inputs,
+        num_rejected_tokens_gpu,
+        slot_mappings,
+    ) -> torch.Tensor:
+        """S3c-1 propose path: drafter at 16 slots, output at budget tokens.
+
+        Mechanics:
+          * Temporarily swap ``self.num_speculative_tokens`` to
+            ``DFLASH_DRAFT_HORIZON`` (15). This makes the inherited
+            ``DFlashProposer.set_inputs_first_pass`` build a
+            ``1 + 15 = 16`` query layout for the drafter forward — i.e.
+            dflash runs in the regime it was trained on, regardless of
+            how many slots the scheduler reserved for the target verify
+            pass.
+          * After ``super().propose(...)`` completes, the discarded
+            return shape would be ``[batch, 15]`` and
+            ``self._ddtree_last_logits`` holds the 15 per-position
+            logits per request via our S1 ``_greedy_sample`` hook.
+          * We then run ``build_ddtree_tree`` per request to expand the
+            15 logits into a ``budget``-node tree, stash the visibility
+            mask onto ``self._ddtree_pending_mask`` (for S3c-2/3 to
+            consume), and return the tree-node token ids reshaped to
+            ``[batch, budget]``.
+
+        Note (S3c-1 only): the runner still verifies these tokens with
+        non-causal attention and no tree mask. Output tokens will not
+        be bit-exact with dflash and may be nonsensical. The mask
+        plumbing (S3c-2) and tree-follow accept (S3c-3) close the gap.
+        """
+        original_num_spec = self.num_speculative_tokens
+        try:
+            self.num_speculative_tokens = self.DFLASH_DRAFT_HORIZON
+            # The inherited propose will sample at DFLASH_DRAFT_HORIZON
+            # positions per request and return [batch, 15] — we ignore
+            # that. _greedy_sample stashes the [B*15, vocab] logits.
+            _ = super().propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                common_attn_metadata=common_attn_metadata,
+                sampling_metadata=sampling_metadata,
+                mm_embed_inputs=mm_embed_inputs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mappings=slot_mappings,
+            )
+        finally:
+            self.num_speculative_tokens = original_num_spec
+
+        # Build the tree from the captured logits and produce
+        # [batch, budget] tree-node token ids. The drafter has now
+        # written its KV cache for 16 internal slots per request; the
+        # remaining (budget - 15) slots reserved by the scheduler are
+        # unused by the drafter (the target overwrites them with tree
+        # nodes for the next verify).
+        return self._ddtree_build_tree_outputs(common_attn_metadata)
+
+    def _ddtree_build_tree_outputs(
+        self, common_attn_metadata: "CommonAttentionMetadata"
+    ) -> torch.Tensor:
+        """Expand drafter logits into a tree and return [batch, budget].
+
+        Also stashes ``self._ddtree_pending_mask`` of shape
+        ``[batch, 1+budget, 1+budget]`` for S3c-2 consumption.
+        """
+        batch_size = int(common_attn_metadata.batch_size())
+        budget = self.ddtree_budget
+        full_size = 1 + budget
+        device = self.device
+
+        logits = self._ddtree_last_logits
+        if logits is None:
+            # Local-argmax reduction path or other unexpected; return a
+            # zero-token fallback that at least preserves shape so the
+            # runner doesn't crash. S3c-2/3 will refine.
+            logger.warning(
+                "ddtree_verify_tree: no logits captured by _greedy_sample; "
+                "returning zero-token fallback."
+            )
+            self._ddtree_pending_mask = None
+            return torch.zeros(
+                (batch_size, budget), dtype=torch.int64, device=device
+            )
+
+        horizon = self.DFLASH_DRAFT_HORIZON
+        expected_rows = batch_size * horizon
+        if logits.dim() != 2 or logits.shape[0] != expected_rows:
+            logger.warning(
+                "ddtree_verify_tree: unexpected logits shape %s "
+                "(expected [%d, vocab]). Falling back to zero tokens.",
+                tuple(logits.shape),
+                expected_rows,
+            )
+            self._ddtree_pending_mask = None
+            return torch.zeros(
+                (batch_size, budget), dtype=torch.int64, device=device
+            )
+
+        logits_per_req = logits.view(batch_size, horizon, -1)
+
+        # We build trees on CPU (build_ddtree_tree is CPU-bound), then
+        # stack and move the outputs to device once.
+        node_tokens_list: list[torch.Tensor] = []
+        mask_list: list[torch.Tensor] = []
+        for req_idx in range(batch_size):
+            req_logits = logits_per_req[req_idx].detach()
+            nti, _nd, _parents, _child_maps, visibility = build_ddtree_tree(
+                req_logits, budget=budget
+            )
+
+            # Pad ``nti`` to fixed length ``budget`` (build_ddtree_tree
+            # can return fewer than ``budget`` if depth_limit*topk is
+            # small; for our gemma-4 dflash horizon=15 and topk capped
+            # at budget=15, it returns exactly budget nodes).
+            n_nodes = int(nti.numel())
+            if n_nodes < budget:
+                pad = torch.zeros(budget - n_nodes, dtype=torch.long)
+                nti_padded = torch.cat([nti, pad], dim=0)
+            else:
+                nti_padded = nti[:budget]
+            node_tokens_list.append(nti_padded)
+
+            mask_cpu = torch.zeros(
+                (full_size, full_size), dtype=torch.bool
+            )
+            seen = 1 + n_nodes
+            if seen > 0:
+                mask_cpu[:seen, :seen] = visibility
+            for pad_idx in range(seen, full_size):
+                mask_cpu[pad_idx, pad_idx] = True
+            mask_list.append(mask_cpu)
+
+        node_tokens_cpu = torch.stack(node_tokens_list, dim=0)
+        mask_cpu_batched = torch.stack(mask_list, dim=0)
+
+        node_tokens = node_tokens_cpu.to(
+            device=device, dtype=torch.int64, non_blocking=True
+        )
+        self._ddtree_pending_mask = mask_cpu_batched.to(
+            device=device, non_blocking=True
+        )
+
+        # One-line trace per call when verify is on (small set of calls
+        # under a benchmark; vllm logger throttles automatically).
+        logger.debug(
+            "ddtree_verify_tree: batch=%d budget=%d horizon=%d "
+            "mask_shape=%s",
+            batch_size,
+            budget,
+            horizon,
+            tuple(self._ddtree_pending_mask.shape),
+        )
+
+        # Drop logits ref before returning.
+        self._ddtree_last_logits = None
+        return node_tokens
 
     def _ddtree_maybe_build_and_log(self, draft_token_ids: torch.Tensor) -> None:
         """Build a per-batch tree mask, stash it, and aggregate stats.
