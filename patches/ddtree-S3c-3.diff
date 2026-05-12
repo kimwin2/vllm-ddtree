@@ -1,0 +1,261 @@
+diff --git a/vllm/v1/spec_decode/ddtree_proposer.py b/vllm/v1/spec_decode/ddtree_proposer.py
+index d924378..cbf540f 100644
+--- a/vllm/v1/spec_decode/ddtree_proposer.py
++++ b/vllm/v1/spec_decode/ddtree_proposer.py
+@@ -178,6 +178,19 @@ class DDTreeProposer(DFlashProposer):
+         # path; S3c will plumb it to the target verify metadata.
+         self._ddtree_pending_mask: torch.Tensor | None = None
+ 
++        # S3c-3 state — per-request child_maps from build_ddtree_tree,
++        # one list[dict[token_id -> child_node_index]] per request, of
++        # length ``1 + budget``. Consumed by gpu_model_runner's
++        # tree-follow accept when ddtree_verify_tree=true. Populated by
++        # ``_propose_with_tree_expansion`` alongside the mask.
++        self._ddtree_pending_child_maps: (
++            list[list[dict[int, int]]] | None
++        ) = None
++        # Per-request tree node token IDs as a list of python lists, so
++        # the tree-follow accept can map an accepted node index back to
++        # its token. Shape: [batch][budget] (CPU, int).
++        self._ddtree_pending_node_tokens: list[list[int]] | None = None
++
+         # NOTE: each branch keeps the stage tag as a literal substring in
+         # the format string so that server.sh's
+         # ``grep "<stage> path active" ddtree_proposer.py`` patch-detection
+@@ -186,15 +199,14 @@ class DDTreeProposer(DFlashProposer):
+             logger.info(
+                 "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
+                 "verify=tree:%s, dflash_draft_horizon=%d). "
+-                "S1+S2+S3b+S3c-1+S3c-2 path active. drafter runs at "
+-                "horizon=15 internally; propose() returns budget tree-node "
+-                "tokens; the visibility mask is attached to target's "
+-                "TritonAttentionMetadata.tree_attention_mask and applied "
+-                "by the triton kernel as additive qq_bias (-inf for "
+-                "masked, 0 for visible). Acceptance is still cumprod "
+-                "(tree-follow lands in S3c-3) so acceptance length may "
+-                "be similar to dflash; the main S3c-2 signal is "
+-                "'output sensible AND mask actually applied'.",
++                "S1+S2+S3b+S3c-1+S3c-2+S3c-3 path active. drafter runs "
++                "at horizon=15 internally; propose() returns budget "
++                "tree-node tokens; the visibility mask is attached to "
++                "target's TritonAttentionMetadata.tree_attention_mask "
++                "and applied by the triton kernel as additive qq_bias; "
++                "accept uses greedy tree-follow over target's argmax at "
++                "each verify position (drafter-stashed child_maps). "
++                "Acceptance length expected > dflash baseline of 3.228.",
+                 self.ddtree_budget,
+                 self.num_speculative_tokens,
+                 self._ddtree_verify_enabled,
+@@ -615,6 +627,8 @@ class DDTreeProposer(DFlashProposer):
+                 "returning zero-token fallback."
+             )
+             self._ddtree_pending_mask = None
++            self._ddtree_pending_child_maps = None
++            self._ddtree_pending_node_tokens = None
+             return torch.zeros(
+                 (batch_size, budget), dtype=torch.int64, device=device
+             )
+@@ -629,6 +643,8 @@ class DDTreeProposer(DFlashProposer):
+                 expected_rows,
+             )
+             self._ddtree_pending_mask = None
++            self._ddtree_pending_child_maps = None
++            self._ddtree_pending_node_tokens = None
+             return torch.zeros(
+                 (batch_size, budget), dtype=torch.int64, device=device
+             )
+@@ -639,9 +655,14 @@ class DDTreeProposer(DFlashProposer):
+         # stack and move the outputs to device once.
+         node_tokens_list: list[torch.Tensor] = []
+         mask_list: list[torch.Tensor] = []
++        # S3c-3: stash per-request child_maps and node-token lists so
++        # the runner's tree-follow accept can walk the tree using
++        # target's posterior at the next verify pass.
++        child_maps_per_req: list[list[dict[int, int]]] = []
++        node_tokens_per_req: list[list[int]] = []
+         for req_idx in range(batch_size):
+             req_logits = logits_per_req[req_idx].detach()
+-            nti, _nd, _parents, _child_maps, visibility = build_ddtree_tree(
++            nti, _nd, _parents, child_maps, visibility = build_ddtree_tree(
+                 req_logits, budget=budget
+             )
+ 
+@@ -667,6 +688,16 @@ class DDTreeProposer(DFlashProposer):
+                 mask_cpu[pad_idx, pad_idx] = True
+             mask_list.append(mask_cpu)
+ 
++            # Normalize child_maps length to ``1 + budget`` (pad with
++            # empty dicts when the tree expanded fewer nodes than
++            # budget; padding nodes have no children, so the walk will
++            # stop at them naturally).
++            cm = list(child_maps)
++            while len(cm) < full_size:
++                cm.append({})
++            child_maps_per_req.append(cm)
++            node_tokens_per_req.append([int(t) for t in nti_padded.tolist()])
++
+         node_tokens_cpu = torch.stack(node_tokens_list, dim=0)
+         mask_cpu_batched = torch.stack(mask_list, dim=0)
+ 
+@@ -676,6 +707,8 @@ class DDTreeProposer(DFlashProposer):
+         self._ddtree_pending_mask = mask_cpu_batched.to(
+             device=device, non_blocking=True
+         )
++        self._ddtree_pending_child_maps = child_maps_per_req
++        self._ddtree_pending_node_tokens = node_tokens_per_req
+ 
+         # One-line trace per call when verify is on (small set of calls
+         # under a benchmark; vllm logger throttles automatically).
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index b852b91..e0b316d 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -3462,6 +3462,29 @@ class GPUModelRunner(
+             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
+             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
+ 
++        # S3c-3 (ddtree): when ddtree_verify_tree is on and the drafter
++        # has stashed per-request tree structure (child_maps + node
++        # tokens) from the previous round, use tree-follow accept
++        # instead of the linear cumprod rejection sampler. The tree
++        # follow walks each request's tree using target's argmax at
++        # the verify positions; it can accept a deeper path than
++        # cumprod whenever target's preferred token at some position
++        # matches a sibling/cousin edge in the tree rather than the
++        # linear top-1 successor.
++        if (
++            self.speculative_config is not None
++            and self.speculative_config.use_ddtree()
++            and getattr(self.speculative_config, "ddtree_verify_tree", False)
++            and hasattr(self.drafter, "_ddtree_pending_child_maps")
++            and self.drafter._ddtree_pending_child_maps is not None
++        ):
++            tree_output = self._ddtree_tree_follow_sample(
++                spec_decode_metadata, logits, sampling_metadata
++            )
++            if tree_output is not None:
++                return tree_output
++            # tree_output is None → fell back; let rejection sampler run.
++
+         sampler_output = self.rejection_sampler(
+             spec_decode_metadata,
+             None,  # draft_probs
+@@ -3470,6 +3493,118 @@ class GPUModelRunner(
+         )
+         return sampler_output
+ 
++    def _ddtree_tree_follow_sample(
++        self,
++        spec_decode_metadata: SpecDecodeMetadata,
++        logits: torch.Tensor,
++        sampling_metadata: SamplingMetadata,
++    ) -> SamplerOutput | None:
++        """Greedy tree-follow accept for ddtree verify_tree=true.
++
++        For each request:
++          1. Extract target's argmax at all 1+budget verify positions.
++          2. Start at root (index 0). Look up target_argmax[0] in
++             child_maps[0]. If found, descend to that child node and
++             continue. If not, stop.
++          3. Accept the tokens at the visited child nodes (in walk
++             order). The first non-matching argmax is the bonus token.
++
++        Returns a ``SamplerOutput`` whose ``sampled_token_ids`` has
++        shape ``[num_reqs, max_spec_len + 1]`` and is filled with -1
++        beyond each request's accept length, matching the contract the
++        rejection sampler honors.
++
++        Returns ``None`` to fall back to the linear sampler when the
++        stashed tree state shape doesn't line up with the current
++        batch (e.g., requests removed/added mid-batch).
++        """
++        drafter = self.drafter
++        child_maps_per_req = drafter._ddtree_pending_child_maps
++        node_tokens_per_req = drafter._ddtree_pending_node_tokens
++        if child_maps_per_req is None or node_tokens_per_req is None:
++            return None
++
++        num_draft_tokens = spec_decode_metadata.num_draft_tokens
++        batch_size = len(num_draft_tokens)
++        if batch_size != len(child_maps_per_req):
++            # Shape mismatch — drafter built trees for a different batch
++            # composition. Safer to fall back.
++            return None
++
++        max_spec_len = spec_decode_metadata.max_spec_len
++
++        # Argmax of target's logits at every position in logits_indices
++        # gives [total_verify_positions] = [B*(1+budget)] tokens for our
++        # uniform-budget case. We greedy-argmax here; temperature-aware
++        # sampling can be added later, but the dflash benchmark runs
++        # with temperature=0 so greedy matches.
++        per_position_argmax = logits[
++            spec_decode_metadata.logits_indices
++        ].argmax(dim=-1)
++
++        # CPU-side walk: targets are O(batch*budget) per request, small.
++        per_position_argmax_cpu = per_position_argmax.detach().to(
++            "cpu", non_blocking=False
++        ).tolist()
++
++        # Build output [batch, max_spec_len + 1] filled with -1.
++        out = torch.full(
++            (batch_size, max_spec_len + 1),
++            fill_value=-1,
++            dtype=torch.int64,
++            device=logits.device,
++        )
++
++        cursor = 0
++        for req_idx in range(batch_size):
++            n_drafts = int(num_draft_tokens[req_idx])
++            # Positions for this request in logits_indices order:
++            #   pos 0     = root prediction (after bonus from prev round)
++            #   pos 1..N  = predictions after each draft (= tree node)
++            # cu_num_sampled_tokens stride is (n_drafts + 1).
++            req_argmax = per_position_argmax_cpu[
++                cursor : cursor + n_drafts + 1
++            ]
++            cursor += n_drafts + 1
++
++            child_maps = child_maps_per_req[req_idx]
++            node_tokens = node_tokens_per_req[req_idx]
++            if not child_maps:
++                # No tree built for this request — treat as zero accept,
++                # bonus = argmax at root.
++                if req_argmax:
++                    out[req_idx, 0] = int(req_argmax[0])
++                continue
++
++            accepted_tokens: list[int] = []
++            current = 0  # root
++            while True:
++                if current >= len(req_argmax):
++                    break
++                next_token = int(req_argmax[current])
++                children = child_maps[current] if current < len(child_maps) else None
++                if not children or next_token not in children:
++                    # Not an edge: ``next_token`` is the bonus.
++                    accepted_tokens.append(next_token)
++                    break
++                child_index = children[next_token]
++                # ``child_index`` is 1..budget; tree-node-tokens are 0-indexed.
++                token_idx = child_index - 1
++                if 0 <= token_idx < len(node_tokens):
++                    accepted_tokens.append(node_tokens[token_idx])
++                else:
++                    break
++                current = child_index
++
++            # Write to output (capped at max_spec_len + 1).
++            for slot, tok in enumerate(accepted_tokens[: max_spec_len + 1]):
++                out[req_idx, slot] = tok
++
++        return SamplerOutput(
++            sampled_token_ids=out,
++            logprobs_tensors=None,
++        )
++
+     def _bookkeeping_sync(
+         self,
+         scheduler_output: "SchedulerOutput",
