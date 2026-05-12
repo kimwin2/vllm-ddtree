@@ -203,10 +203,15 @@ class DDTreeProposer(DFlashProposer):
                 "at horizon=15 internally; propose() returns budget "
                 "tree-node tokens; the visibility mask is attached to "
                 "target's TritonAttentionMetadata.tree_attention_mask "
-                "and applied by the triton kernel as additive qq_bias; "
-                "accept uses greedy tree-follow over target's argmax at "
-                "each verify position (drafter-stashed child_maps). "
-                "Acceptance length expected > dflash baseline of 3.228.",
+                "and applied by the triton kernel as additive qq_bias. "
+                "Tree-follow accept is GATED OFF in this build (S3c-3-"
+                "quick fallback) pending S3c-4 KV slot compaction — "
+                "without compaction, scattered tree-path accepts leave "
+                "the next round's drafter with wrong prefix KV and "
+                "acceptance length drops below cumprod baseline. So "
+                "the verify-side tree path (S3c-2) IS exercised but "
+                "the accept side reverts to linear cumprod. Expected "
+                "acceptance length: dflash baseline 3.228.",
                 self.ddtree_budget,
                 self.num_speculative_tokens,
                 self._ddtree_verify_enabled,

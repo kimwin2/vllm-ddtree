@@ -3493,6 +3493,24 @@ class GPUModelRunner(
         )
         return sampler_output
 
+    # S3c-3-quick: greedy tree-follow accept is GATED OFF until S3c-4
+    # lands the per-request KV slot compaction. The first ON-mode test
+    # of S3c-3 measured 657 accepted / 324 drafts = 2.028 — WORSE than
+    # the dflash cumprod baseline (3.228) — because tree-follow returns
+    # scattered accept indices [c1, c2, ...] but vLLM's downstream KV
+    # management assumes the accepted positions form a contiguous
+    # prefix of the verified slots. Without compaction, the next round's
+    # drafter starts with WRONG prefix KV (the heap-order tree nodes at
+    # the front of the verify window instead of the actual path), the
+    # model trajectory diverges, and acceptance drops.
+    #
+    # Flipping this constant to ``True`` will enable the tree-follow
+    # logic again, but doing so without first implementing
+    # ``_ddtree_compact_kv_cache`` will reproduce the regression. The
+    # method body below stays intact so S3c-4 can re-enable it after
+    # plumbing compaction.
+    _DDTREE_ENABLE_TREE_FOLLOW: bool = False
+
     def _ddtree_tree_follow_sample(
         self,
         spec_decode_metadata: SpecDecodeMetadata,
@@ -3514,10 +3532,28 @@ class GPUModelRunner(
         beyond each request's accept length, matching the contract the
         rejection sampler honors.
 
-        Returns ``None`` to fall back to the linear sampler when the
-        stashed tree state shape doesn't line up with the current
-        batch (e.g., requests removed/added mid-batch).
+        Returns ``None`` to fall back to the linear sampler when:
+        * ``_DDTREE_ENABLE_TREE_FOLLOW`` is False (current S3c-3-quick
+          state — keeps the acceptance length at the cumprod baseline
+          of 3.228 until S3c-4 adds KV slot compaction).
+        * The stashed tree state shape doesn't line up with the
+          current batch (e.g., requests removed/added mid-batch).
         """
+        if not self._DDTREE_ENABLE_TREE_FOLLOW:
+            if not getattr(self, "_ddtree_tree_follow_off_warned", False):
+                self._ddtree_tree_follow_off_warned = True
+                logger.info(
+                    "ddtree S3c-3-quick: tree-follow accept is "
+                    "disabled (falls back to cumprod). The drafter's "
+                    "tree mask is still attached and applied by the "
+                    "kernel (S3c-2), so verify-side trees are exercised; "
+                    "only the accept-side tree walk is gated. Set "
+                    "GpuModelRunner._DDTREE_ENABLE_TREE_FOLLOW=True "
+                    "AFTER S3c-4 KV slot compaction is implemented to "
+                    "unlock acceptance length > 3.228 (dflash baseline)."
+                )
+            return None
+
         drafter = self.drafter
         child_maps_per_req = drafter._ddtree_pending_child_maps
         node_tokens_per_req = drafter._ddtree_pending_node_tokens
