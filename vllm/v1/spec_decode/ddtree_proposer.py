@@ -113,6 +113,11 @@ class DDTreeProposer(DFlashProposer):
         # S3 will use these; S1/S2 only measure.
         self._ddtree_verify_enabled: bool = False
 
+        # The base proposer accepts ``runner`` but doesn't store it. We
+        # need it for the S2 target-side capability probe to reach
+        # ``runner.attn_groups``, so keep a reference ourselves.
+        self._ddtree_runner = runner
+
         # S2 state — set by _ddtree_probe_attention_backends() during
         # initialize_attn_backend. Default False until the probe runs.
         self._has_tree_mask_support: bool = False
@@ -206,8 +211,12 @@ class DDTreeProposer(DFlashProposer):
         )
 
     def _ddtree_target_attn_groups(self) -> list[Any]:
-        """Flatten the runner's target attn_groups across KV cache groups."""
-        runner = getattr(self, "runner", None)
+        """Flatten the runner's target attn_groups across KV cache groups.
+
+        ``self._ddtree_runner`` is captured in ``__init__`` because the
+        base proposer accepts ``runner`` but does not retain it.
+        """
+        runner = self._ddtree_runner
         if runner is None:
             return []
         raw = getattr(runner, "attn_groups", None)
