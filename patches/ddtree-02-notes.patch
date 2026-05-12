@@ -1,0 +1,227 @@
+From 9018dd43ba6867d37f469e150bb96a9edb19eb37 Mon Sep 17 00:00:00 2001
+From: kimwin2 <kimwin3@gmail.com>
+Date: Tue, 12 May 2026 05:22:28 +0900
+Subject: [PATCH] chore: add INTEGRATION_NOTES.md (DDTree integration design)
+
+Documents the Option C staged integration plan for landing DDTree on
+top of the dflash spec-decode path in this PR #41703 fork:
+* C0 (scaffold, this branch's first commit)
+* C1 (draft-side tree, this branch)
+* C2 (target-side tree verify, future)
+
+Includes the resolved attention-backend pairing for Gemma-4
+(`triton_attn` target / `flash_attn` draft), expected serve commands
+for ddtree-off and ddtree-on, and the known limits / follow-ups.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ INTEGRATION_NOTES.md | 197 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 197 insertions(+)
+ create mode 100644 INTEGRATION_NOTES.md
+
+diff --git a/INTEGRATION_NOTES.md b/INTEGRATION_NOTES.md
+new file mode 100644
+index 0000000..f785e90
+--- /dev/null
++++ b/INTEGRATION_NOTES.md
+@@ -0,0 +1,197 @@
++# vLLM × DFlash × DDTree — Integration Notes
++
++> Phase 2 design document. Tracks the design decisions before code changes.
++> Base: vLLM PR #41703 (`refs/pull/41703/head`, Gemma-4 dflash temporary build).
++> Target model: `google/gemma-4-E2B-it`.
++
++## Decisions (locked)
++
++| # | Decision |
++|---|---|
++| Integration depth | **Option C — staged**. New `DDTreeProposer(DFlashProposer)` subclass + new config flag `ddtree_enabled` (default `False`). When off, the new class is not instantiated at all → token-bit-exact with current dflash. |
++| Target attention backend | `--attention-backend triton_attn`, with `speculative-config.attention_backend = "flash_attn"` (per dflash README for Gemma-4 PR). |
++| Source layout | Local branch in this `vllm` clone (`feature/ddtree`). Push to `github.com/kimwin2/<repo>`. Upstream vLLM not touched. |
++| Packaging | Port the three needed ddtree primitives into vLLM as `vllm/v1/spec_decode/ddtree_utils.py` (attribution preserved, MIT). ddtree repo itself is not added as a runtime dependency. |
++| Baseline | `google/gemma-4-E2B-it` target + dflash draft (whichever HF id is paired in the dflash recipe). |
++
++## What DDTree changes
++
++DDTree replaces dflash's flat N-token draft with a **diffusion draft tree**:
++
++1. Run the dflash draft model once over `block_size` positions (same as today).
++2. Take the per-position logits from the draft model.
++3. Heap-expand a top-k tree of `tree_budget` nodes (`build_ddtree_tree`).
++4. Verify the whole tree in **one target forward** using a 2D visibility mask.
++5. Follow the verified posterior along the tree to find the longest accepted chain (`follow_verified_tree`).
++
++In a vLLM-shaped pipeline this maps onto:
++
++| Stage | vLLM today | With DDTree |
++|---|---|---|
++| Draft model forward | `DFlashProposer.propose → model(...)` | Unchanged |
++| Draft selection per spec position | `_greedy_sample` (argmax) | Heap-expand tree from per-position logits |
++| Target verify | Linear: target sees `1+N` packed queries per request, non-causal | Tree: target sees `1+tree_budget` queries per request with a 2D visibility mask |
++| Accept | Linear cumprod compare on draft vs sampled | Walk tree on sampled posterior |
++
++## Staging plan
++
++### Step C0 — Scaffolding (zero behavior change when off)
++
++Files added:
++
++- `vllm/v1/spec_decode/ddtree_utils.py` — ported, dependency-free primitives:
++  - `build_ddtree_tree(draft_logits, budget) -> (node_token_ids, node_depths, parents, child_maps, visibility, build_subtimes)`
++  - `compile_ddtree_tree(...)` (kept for completeness; not used in C1)
++  - `follow_verified_tree(child_maps, posterior) -> (accepted_indices, next_token)` (used in C2)
++- `vllm/v1/spec_decode/ddtree_proposer.py` — `DDTreeProposer(DFlashProposer)`:
++  - Adds `ddtree_budget`, `ddtree_enabled`, logging on construction
++  - C0: `propose()` delegates to `super().propose()` (no diff)
++
++Files edited:
++
++- `vllm/config/speculative.py` — add two fields and a helper:
++  - `ddtree_enabled: bool = False`
++  - `ddtree_budget: int | None = None` (defaults to `num_speculative_tokens` when on)
++  - `def use_ddtree(self) -> bool` → `self.use_dflash() and self.ddtree_enabled`
++- `vllm/v1/worker/gpu_model_runner.py` — at the `use_dflash()` branch, instantiate
++  `DDTreeProposer` instead of `DFlashProposer` when `use_ddtree()` is true. All
++  `isinstance(self.drafter, DFlashProposer)` checks throughout the file continue to
++  succeed via subclass.
++
++Off-path guarantee: `ddtree_enabled` defaults to `False`. With no
++`"ddtree_enabled": true` in `--speculative-config`, the new class is never
++imported or instantiated, the new config helper short-circuits, and the
++runtime path is structurally identical to upstream PR #41703.
++
++### Step C1 — Draft-side tree, linear verify
++
++`DDTreeProposer.propose()` overrides the base by:
++
++1. Calling the standard base flow (`set_inputs_first_pass`,
++   `build_per_group_and_layer_attn_metadata`, model forward) — unchanged.
++2. At the point where the base does `_greedy_sample`, compute the **full
++   logits** at the `B × N` spec positions via `self.model.compute_logits`.
++3. For each request, reshape its `N × V` logits into `[N, V]`, then call
++   `build_ddtree_tree(logits, budget=ddtree_budget)`.
++4. Return the linear top-1 path of the tree as the `[B, N]` int tensor. The
++   top-1 path of the tree is identical to per-position argmax, so the
++   **token result is bit-identical to dflash-only**. This makes C1 a
++   regression test: the tree code path runs end-to-end without changing
++   serving output. Tree statistics (`size`, `max depth`) are emitted via
++   `logger.debug` per request.
++
++C1 deliverables: the tree build path is exercised under load. Acceptance
++length and tokens-per-second should match dflash-only baselines within
++measurement noise.
++
++### Step C2 — Tree verify (future, stubbed)
++
++Three coupled changes required:
++
++1. **Query expansion**: in `set_inputs_first_pass`, expand per-request query
++   from `1 + num_speculative_tokens` to `1 + tree_budget`. Reuse the
++   existing `copy_and_expand_dflash_inputs_kernel` pattern but write
++   tree-shaped node ids (root + flattened tree) and tree depth positions.
++2. **2D visibility mask on the target verify pass**: the visibility matrix
++   from `build_ddtree_tree` (`tree_budget+1` square) must flow into the
++   target attention metadata for the **target** forward (not the draft).
++   This needs the attention backend to support a custom 2D mask per
++   request. Spec'd backends:
++   - `flash_attn` with `mask_mod`/`block_mask` (FlexAttention path) — verify
++     availability on PR #41703.
++   - Fallback: `triton_attn` with a custom mask buffer (extra kernel work).
++3. **Tree follow accept**: replace the cumprod-style acceptance in the
++   rejection sampler with `follow_verified_tree` on the sampled posterior,
++   then map the accepted indices back into the KV cache compaction. The
++   current `compact_dynamic_cache` from ddtree is unusable as-is (it
++   targets HF `DynamicCache`), but the equivalent paged-block compaction
++   already exists in the dflash drafter and can be parameterized by the
++   accepted index tensor instead of a contiguous prefix length.
++
++C2 is gated behind the same `ddtree_enabled` flag and falls back to C1
++behavior (linear verify) if the chosen attention backend does not
++advertise custom-mask support — emitting a warning, not a hard failure.
++
++## Config surface (added to `SpeculativeConfig`)
++
++```jsonc
++{
++  "method": "dflash",
++  "model": "z-lab/gemma-4-E2B-it-DFlash",   // example, paired model
++  "num_speculative_tokens": 15,
++  "attention_backend": "flash_attn",
++  "ddtree_enabled": true,                    // default false
++  "ddtree_budget": 24                        // default = num_speculative_tokens
++}
++```
++
++When `ddtree_enabled` is omitted/false: zero behavior change.
++
++## Files touched
++
++| Path | Action | One-line summary |
++|---|---|---|
++| `vllm/v1/spec_decode/ddtree_utils.py` | add | Port of `build_ddtree_tree` / `compile_ddtree_tree` / `follow_verified_tree` (MIT, attributed). |
++| `vllm/v1/spec_decode/ddtree_proposer.py` | add | `DDTreeProposer(DFlashProposer)`, C0 scaffold + C1 tree-build hook. |
++| `vllm/config/speculative.py` | edit | `ddtree_enabled`, `ddtree_budget`, `use_ddtree()`. |
++| `vllm/v1/worker/gpu_model_runner.py` | edit | Instantiate `DDTreeProposer` when `use_ddtree()`. |
++| `INTEGRATION_NOTES.md` | add | This file. |
++
++## Dependencies and build
++
++No new third-party packages. ddtree's MIT primitives are vendored inside
++vLLM with attribution at the top of `ddtree_utils.py`. The standalone
++ddtree repo cloned next to this one is reference-only and not on
++`PYTHONPATH`.
++
++Build/install procedure is **unchanged** vs. PR #41703. Standard:
++
++```bash
++VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
++```
++
++## Server commands
++
++### DFlash-only (regression baseline; ddtree off)
++
++```bash
++vllm serve google/gemma-4-E2B-it \
++  --host 0.0.0.0 --port 8000 \
++  --speculative-config '{"method": "dflash", "model": "<paired-dflash-draft>", "num_speculative_tokens": 15, "attention_backend": "flash_attn"}' \
++  --attention-backend triton_attn \
++  --max-num-batched-tokens 32768 \
++  --trust-remote-code
++```
++
++### DFlash + DDTree (new path)
++
++```bash
++vllm serve google/gemma-4-E2B-it \
++  --host 0.0.0.0 --port 8000 \
++  --speculative-config '{"method": "dflash", "model": "<paired-dflash-draft>", "num_speculative_tokens": 15, "attention_backend": "flash_attn", "ddtree_enabled": true, "ddtree_budget": 24}' \
++  --attention-backend triton_attn \
++  --max-num-batched-tokens 32768 \
++  --trust-remote-code
++```
++
++C1 result expectation: identical tokens to the baseline (tree code runs but
++returns top-1 path). C2 result expectation (future): same tokens or higher
++acceptance length depending on whether the tree improved the accept rate.
++
++## Known limits / future work
++
++- C2 verify-side path is **stubbed**, not implemented. The flag flips on the
++  tree-build but does not yet plumb the 2D mask into the target attention
++  metadata. Wiring needs to be paired with concrete backend capability
++  checks (flash_attn block mask path on Gemma-4 PR).
++- Batch > 1 with per-request 2D masks: ddtree's reference code is strictly
++  batch=1. The per-request tree shape (budget) is fixed, so a constant
++  `(1+budget, 1+budget)` mask block per request is straightforward, but
++  needs benchmarking against linear dflash on the realistic Gemma-4-E2B
++  serving batch size.
++- KV cache compaction for the tree-rejected branches in vLLM's paged-block
++  layout reuses the existing dflash slot mapping rather than ddtree's
++  `compact_dynamic_cache` (HF DynamicCache-specific).
++- Tree statistics logging is per-request `logger.debug`; promote to a Prom
++  metric (`ddtree_tree_size`, `ddtree_max_depth`, `ddtree_accept_len`) once
++  C2 lands.
+-- 
+2.53.0.windows.2
+

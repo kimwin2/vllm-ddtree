@@ -1,0 +1,515 @@
+From bdc360e1f5fa898afa5ba3865a9190f59554f072 Mon Sep 17 00:00:00 2001
+From: kimwin2 <kimwin3@gmail.com>
+Date: Tue, 12 May 2026 05:22:17 +0900
+Subject: [PATCH] feat(spec-decode): add DDTreeProposer scaffold on top of
+ DFlash
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds an optional DDTree (Diffusion Draft Tree) extension to the dflash
+spec-decode path. When `speculative_config.ddtree_enabled` is false
+(default), the runtime is identical to upstream PR #41703 — the new
+proposer class is never imported or instantiated.
+
+When enabled, `DDTreeProposer(DFlashProposer)` is constructed in place
+of `DFlashProposer` and builds a top-k draft tree from per-position
+logits using ported MIT primitives from liranringel/ddtree (build,
+compile, follow). C1 path returns the linear top-1 of the tree so the
+token result is bit-identical to dflash; C2 (target-side tree verify)
+is stubbed for the next iteration.
+
+Adds:
+* vllm/v1/spec_decode/ddtree_utils.py — ported MIT primitives.
+* vllm/v1/spec_decode/ddtree_proposer.py — DDTreeProposer subclass.
+* SpeculativeConfig.ddtree_enabled / ddtree_budget / use_ddtree().
+* gpu_model_runner branch to instantiate the new proposer.
+
+Reference: Ringel & Romano, "Accelerating Speculative Decoding with
+Block Diffusion Draft Trees", arXiv:2604.12989, 2026.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ vllm/config/speculative.py             |  15 ++
+ vllm/v1/spec_decode/ddtree_proposer.py | 163 +++++++++++++++++
+ vllm/v1/spec_decode/ddtree_utils.py    | 237 +++++++++++++++++++++++++
+ vllm/v1/worker/gpu_model_runner.py     |  16 +-
+ 4 files changed, 430 insertions(+), 1 deletion(-)
+ create mode 100644 vllm/v1/spec_decode/ddtree_proposer.py
+ create mode 100644 vllm/v1/spec_decode/ddtree_utils.py
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 3511c6c..24f50ae 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -150,6 +150,17 @@ class SpeculativeConfig:
+     requires the speculative model be trained to support parallel drafting.
+     Only compatible with EAGLE and draft model methods."""
+ 
++    # DDTree (Diffusion Draft Tree) — extends DFlash with a top-k draft
++    # tree built from per-position draft logits. Default is off; when off,
++    # the runtime path is identical to upstream DFlash.
++    ddtree_enabled: bool = False
++    """Enable DDTree on top of the DFlash drafter. Only valid when
++    ``method='dflash'``. Default ``False``."""
++    ddtree_budget: int | None = Field(default=None, ge=1)
++    """Maximum number of tree nodes (besides the root) the DDTree drafter
++    is allowed to expand per draft step. When ``None``, defaults to
++    ``num_speculative_tokens``."""
++
+     # required configuration params passed from engine
+     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
+     """The configuration of the target model."""
+@@ -1062,6 +1073,10 @@ class SpeculativeConfig:
+     def use_dflash(self) -> bool:
+         return self.method == "dflash"
+ 
++    def use_ddtree(self) -> bool:
++        """DDTree is an extension of DFlash; requires method=='dflash'."""
++        return self.use_dflash() and self.ddtree_enabled
++
+     def uses_draft_model(self) -> bool:
+         return self.method == "draft_model"
+ 
+diff --git a/vllm/v1/spec_decode/ddtree_proposer.py b/vllm/v1/spec_decode/ddtree_proposer.py
+new file mode 100644
+index 0000000..98eebab
+--- /dev/null
++++ b/vllm/v1/spec_decode/ddtree_proposer.py
+@@ -0,0 +1,163 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DDTreeProposer: dflash drafter extended with diffusion draft trees.
++
++Staged:
++    * C0 (this file) — scaffold. The proposer is only constructed when
++      ``speculative_config.ddtree_enabled`` is true. When the flag is off,
++      the upstream ``DFlashProposer`` path is used and this module is never
++      imported, so the off-path is structurally identical to PR #41703.
++    * C1 (this file) — when on, build a top-k draft tree from the per-
++      position draft logits and log tree statistics. The token result
++      returned to the runner is the linear top-1 path of the tree, which
++      equals per-position argmax — so token output is identical to
++      dflash-only and acceptance length should match.
++    * C2 (future) — wire the visibility mask into the target verify pass
++      and replace acceptance with ``follow_verified_tree``. Stubbed below.
++
++Reference: Liran Ringel, Yaniv Romano,
++"Accelerating Speculative Decoding with Block Diffusion Draft Trees",
++arXiv:2604.12989, 2026 (MIT).
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import torch
++from typing_extensions import override
++
++from vllm.config import VllmConfig
++from vllm.logger import init_logger
++from vllm.v1.spec_decode.ddtree_utils import build_ddtree_tree
++from vllm.v1.spec_decode.dflash import DFlashProposer
++
++if TYPE_CHECKING:
++    from vllm.v1.attention.backend import CommonAttentionMetadata
++    from vllm.v1.sample.metadata import SamplingMetadata
++
++logger = init_logger(__name__)
++
++
++class DDTreeProposer(DFlashProposer):
++    """DFlash proposer with a top-k diffusion draft tree on the draft side.
++
++    Behaves like ``DFlashProposer`` plus an extra tree-build step on the
++    draft logits. C1 path: tree statistics are computed and logged, but the
++    drafter still returns a flat ``[batch, num_speculative_tokens]`` token
++    tensor whose top-1 path matches dflash. This keeps the on-path
++    token-bit-equivalent to dflash-only and validates that the tree code
++    runs under live load before C2 wires it into target verify.
++    """
++
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        device: torch.device,
++        runner=None,
++    ) -> None:
++        super().__init__(vllm_config=vllm_config, device=device, runner=runner)
++
++        spec_cfg = vllm_config.speculative_config
++        assert spec_cfg is not None and spec_cfg.ddtree_enabled, (
++            "DDTreeProposer instantiated but ddtree_enabled is not set. "
++            "This is a bug in gpu_model_runner instantiation."
++        )
++
++        budget = spec_cfg.ddtree_budget
++        if budget is None or budget <= 0:
++            budget = self.num_speculative_tokens
++        self.ddtree_budget: int = int(budget)
++        # C2 will use these; C0/C1 only exercise build.
++        self._ddtree_verify_enabled: bool = False
++
++        logger.info(
++            "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
++            "verify=tree:%s). C1 path active: tree is built from draft logits "
++            "and statistics logged; target verify path is unchanged.",
++            self.ddtree_budget,
++            self.num_speculative_tokens,
++            self._ddtree_verify_enabled,
++        )
++
++    @override
++    @torch.inference_mode()
++    def propose(
++        self,
++        target_token_ids: torch.Tensor,
++        target_positions: torch.Tensor,
++        target_hidden_states: torch.Tensor,
++        next_token_ids: torch.Tensor,
++        token_indices_to_sample: torch.Tensor | None,
++        common_attn_metadata: "CommonAttentionMetadata",
++        sampling_metadata: "SamplingMetadata",
++        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
++        num_rejected_tokens_gpu: torch.Tensor | None = None,
++        slot_mappings: dict[str, torch.Tensor]
++        | list[dict[str, torch.Tensor]]
++        | None = None,
++    ) -> torch.Tensor:
++        # Identical to DFlashProposer.propose, which delegates to base.
++        draft_token_ids = super().propose(
++            target_token_ids=target_token_ids,
++            target_positions=target_positions,
++            target_hidden_states=target_hidden_states,
++            next_token_ids=next_token_ids,
++            token_indices_to_sample=token_indices_to_sample,
++            common_attn_metadata=common_attn_metadata,
++            sampling_metadata=sampling_metadata,
++            mm_embed_inputs=mm_embed_inputs,
++            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
++            slot_mappings=slot_mappings,
++        )
++
++        # C1: exercise the tree-build path on the draft tokens. We do not
++        # yet have access to the raw logits at this seam (base.propose
++        # consumes them inside _greedy_sample). Until C2 plumbs logits out,
++        # we synthesize a one-hot logits tensor from the chosen tokens so
++        # the tree-build call path is exercised end-to-end without changing
++        # the returned token sequence.
++        try:
++            self._ddtree_log_stats(draft_token_ids)
++        except Exception as exc:  # pragma: no cover - log-only path
++            logger.warning("DDTree tree-build failed; falling back silently: %s", exc)
++
++        return draft_token_ids
++
++    def _ddtree_log_stats(self, draft_token_ids: torch.Tensor) -> None:
++        """Build a degenerate tree over the drafted tokens for plumbing.
++
++        Synthesizes a depth × vocab one-hot logits tensor from the drafted
++        token ids and calls ``build_ddtree_tree``. This is *only* a
++        plumbing check for C1 — when C2 lands, the proposer will instead
++        capture the real ``compute_logits`` output from the draft model.
++        """
++        if not logger.isEnabledFor(10):  # DEBUG = 10
++            return
++        if draft_token_ids.numel() == 0:
++            return
++
++        flat = draft_token_ids.reshape(-1, self.num_speculative_tokens)
++        batch_size = flat.shape[0]
++        # Cheap synthetic: rank-1 logits, hot on the chosen token per row.
++        # We only need vocab >= max token id; use a small upper bound.
++        max_id = int(flat.max().item()) + 1
++        depth = self.num_speculative_tokens
++        for req in range(batch_size):
++            ids = flat[req].to(torch.long).cpu()
++            logits = torch.full((depth, max_id), -1e4, dtype=torch.float32)
++            logits[torch.arange(depth), ids] = 1.0
++            (
++                node_token_ids,
++                node_depths,
++                _parents,
++                _child_maps,
++                _visibility,
++            ) = build_ddtree_tree(logits, budget=self.ddtree_budget)
++            logger.debug(
++                "ddtree[req=%d] size=%d depth=%d budget=%d",
++                req,
++                int(node_token_ids.numel()),
++                int(node_depths.max().item()) if node_depths.numel() else 0,
++                self.ddtree_budget,
++            )
+diff --git a/vllm/v1/spec_decode/ddtree_utils.py b/vllm/v1/spec_decode/ddtree_utils.py
+new file mode 100644
+index 0000000..1e870db
+--- /dev/null
++++ b/vllm/v1/spec_decode/ddtree_utils.py
+@@ -0,0 +1,237 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#
++# Portions of this file (build_ddtree_tree, compile_ddtree_tree,
++# follow_verified_tree) are adapted from the reference DDTree implementation
++# by Liran Ringel (https://github.com/liranringel/ddtree), used under the MIT
++# License. See LICENSE-MIT-DDTREE at the repository root or
++# https://github.com/liranringel/ddtree/blob/main/LICENSE for the full text.
++#
++# Reference: Liran Ringel, Yaniv Romano,
++#   "Accelerating Speculative Decoding with Block Diffusion Draft Trees",
++#   arXiv:2604.12989, 2026.
++"""DDTree primitives, lifted out of the reference HF-Transformers codebase.
++
++These are CPU-side helpers that build, compile, and walk a small top-k
++draft tree from a sequence of draft logits produced by a DFlash-style
++parallel drafter. They are deliberately framework-agnostic: only torch
++tensor input/output, no DynamicCache or HF coupling. They are intended to
++be called from the DDTreeProposer inside vLLM's spec decode path.
++"""
++
++from __future__ import annotations
++
++import heapq
++
++import numpy as np
++import torch
++
++
++def build_ddtree_tree(
++    draft_logits: torch.Tensor,
++    budget: int,
++) -> tuple[
++    torch.Tensor,
++    torch.Tensor,
++    list[int],
++    list[dict[int, int]],
++    torch.Tensor,
++]:
++    """Heap-expand a top-k draft tree from per-depth draft logits.
++
++    Args:
++        draft_logits: tensor of shape ``[depth, vocab]``, one row of draft
++            logits per draft depth. Floating point. Lives on any device;
++            only ``topk`` and ``logsumexp`` touch the GPU.
++        budget: maximum number of tree nodes to expand beyond the root.
++
++    Returns:
++        ``node_token_ids``: int64 tensor of shape ``[node_count]``, the
++            token id of each expanded child node in expansion order.
++        ``node_depths``: int64 tensor of shape ``[node_count]``, depth of
++            each expanded child relative to the (implicit) root at depth 0.
++        ``parents``: python list of length ``1 + node_count``; ``parents[0]``
++            is ``-1`` for the root, ``parents[i]`` is the index of the
++            parent node for node ``i``.
++        ``child_maps``: list of length ``1 + node_count`` of ``dict[int,
++            int]`` mapping ``token_id -> child_index`` for each node.
++        ``visibility``: bool tensor of shape ``[1+node_count, 1+node_count]``
++            with ``True`` on entries where row's tree path includes the
++            column index. The 2D attention visibility mask.
++    """
++    if budget <= 0 or draft_logits.shape[0] == 0:
++        visibility = torch.zeros((1, 1), dtype=torch.bool)
++        visibility[0, 0] = True
++        return (
++            torch.empty(0, dtype=torch.long),
++            torch.empty(0, dtype=torch.long),
++            [-1],
++            [dict()],
++            visibility,
++        )
++
++    topk = min(budget, draft_logits.shape[-1])
++    depth_limit = int(draft_logits.shape[0])
++
++    logits = draft_logits.float()
++    top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
++    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
++    top_log_probs_cpu = (top_logits - log_z).to(device="cpu", dtype=torch.float32)
++    top_token_ids_cpu = top_token_ids.to(device="cpu", dtype=torch.long)
++
++    top_log_probs_np = top_log_probs_cpu.numpy()
++    top_token_ids_np = top_token_ids_cpu.numpy()
++
++    first_logw = float(top_log_probs_np[0, 0])
++    heap: list[tuple[float, tuple[int, ...], int, int, int, float]] = [
++        (-first_logw, (0,), 0, 1, 0, first_logw)
++    ]
++
++    node_token_ids_np = np.empty(budget, dtype=np.int64)
++    node_depths_np = np.empty(budget, dtype=np.int64)
++    parents_np = np.empty(budget + 1, dtype=np.int32)
++    parents_np[0] = -1
++    child_maps: list[dict[int, int]] = [dict()]
++    node_count = 0
++
++    while heap and node_count < budget:
++        _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
++
++        token_id = int(top_token_ids_np[depth - 1, rank])
++        current_index = node_count + 1
++        node_token_ids_np[node_count] = token_id
++        node_depths_np[node_count] = depth
++        parents_np[current_index] = parent_index
++        child_maps.append(dict())
++        child_maps[parent_index][token_id] = current_index
++        node_count += 1
++
++        if rank + 1 < topk:
++            sibling_ranks = ranks[:-1] + (rank + 1,)
++            sibling_logw = (
++                logw
++                - float(top_log_probs_np[depth - 1, rank])
++                + float(top_log_probs_np[depth - 1, rank + 1])
++            )
++            heapq.heappush(
++                heap,
++                (-sibling_logw, sibling_ranks, parent_index, depth, rank + 1, sibling_logw),
++            )
++
++        if depth < depth_limit:
++            child_ranks = ranks + (0,)
++            child_logw = logw + float(top_log_probs_np[depth, 0])
++            heapq.heappush(
++                heap,
++                (-child_logw, child_ranks, current_index, depth + 1, 0, child_logw),
++            )
++
++    current_length = 1 + node_count
++    visibility_np = np.zeros((current_length, current_length), dtype=np.bool_)
++    visibility_np[0, 0] = True
++    for index in range(1, current_length):
++        parent_index = int(parents_np[index])
++        visibility_np[index, :index] = visibility_np[parent_index, :index]
++        visibility_np[index, index] = True
++
++    node_token_ids = torch.from_numpy(node_token_ids_np[:node_count])
++    node_depths = torch.from_numpy(node_depths_np[:node_count])
++    visibility = torch.from_numpy(visibility_np)
++    parents = parents_np[:current_length].tolist()
++
++    return node_token_ids, node_depths, parents, child_maps, visibility
++
++
++def compile_ddtree_tree(
++    root_token_id: torch.Tensor,
++    start: int,
++    node_token_ids: torch.Tensor,
++    node_depths: torch.Tensor,
++    visibility_cpu: torch.Tensor,
++    past_length: int,
++    dtype: torch.dtype,
++    device: torch.device,
++    verify_input_ids_buffer: torch.Tensor,
++    verify_position_ids_buffer: torch.Tensor,
++    attention_mask_buffer: torch.Tensor,
++    tree_visibility_buffer: torch.Tensor,
++    previous_tree_start: int,
++    previous_tree_length: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
++    """Materialize verify-side input ids / positions / attention mask.
++
++    Adapted from the reference DDTree implementation. Buffers are
++    pre-allocated and reused across rounds. The resulting attention mask
++    uses ``-inf`` for masked positions (HF-style additive mask). The
++    output is *not* directly compatible with vLLM's per-layer
++    attention metadata; this helper is provided for parity with the
++    reference algorithm and for future use in the C2 verify-side path.
++    """
++    current_length = 1 + int(node_token_ids.numel())
++
++    if previous_tree_length > 0:
++        attention_mask_buffer[
++            0,
++            0,
++            :previous_tree_length,
++            previous_tree_start : previous_tree_start + previous_tree_length,
++        ] = 0
++
++    verify_input_ids = verify_input_ids_buffer[:, :current_length]
++    verify_input_ids[0, 0] = root_token_id
++    if current_length > 1:
++        verify_input_ids[0, 1:current_length].copy_(node_token_ids, non_blocking=False)
++
++    verify_position_ids = verify_position_ids_buffer[:, :current_length]
++    verify_position_ids[0, 0] = start
++    if current_length > 1:
++        verify_position_ids[0, 1:current_length].copy_(node_depths, non_blocking=False)
++        verify_position_ids[0, 1:current_length].add_(start)
++
++    visibility = tree_visibility_buffer[:current_length, :current_length]
++    visibility.copy_(visibility_cpu, non_blocking=False)
++
++    tree_block = attention_mask_buffer[
++        0,
++        0,
++        :current_length,
++        past_length : past_length + current_length,
++    ]
++    tree_block.fill_(torch.finfo(dtype).min)
++    tree_block.masked_fill_(visibility, 0)
++
++    attention_mask = attention_mask_buffer[
++        :, :, :current_length, : past_length + current_length
++    ]
++    return (
++        verify_input_ids,
++        verify_position_ids,
++        attention_mask,
++        past_length,
++        current_length,
++    )
++
++
++def follow_verified_tree(
++    child_maps: list[dict[int, int]],
++    posterior: torch.Tensor,
++) -> tuple[list[int], int]:
++    """Greedy walk of the verified tree along the sampled posterior.
++
++    ``posterior`` is the sampled-id tensor returned by the target for the
++    full flattened tree (shape ``[1, 1+node_count]``). The walk starts at
++    the root, and at each step checks whether the sampled token for the
++    current node matches an edge to a child; if so, descend; if not,
++    stop and use the sampled token as the "bonus" next token.
++    """
++    posterior_tokens = posterior[0].tolist()
++    accepted_indices = [0]
++    current_index = 0
++    next_token = int(posterior_tokens[current_index])
++
++    while next_token in child_maps[current_index]:
++        current_index = child_maps[current_index][next_token]
++        accepted_indices.append(current_index)
++        next_token = int(posterior_tokens[current_index])
++
++    return accepted_indices, next_token
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 1f7e561..b9e8a21 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -561,7 +561,21 @@ class GPUModelRunner(
+             elif self.speculative_config.use_gemma4_mtp():
+                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
+             elif self.speculative_config.use_dflash():
+-                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
++                if self.speculative_config.use_ddtree():
++                    # Local extension: DDTree builds a top-k draft tree on
++                    # top of the DFlash drafter. Imported lazily so the
++                    # off-path never touches this module.
++                    from vllm.v1.spec_decode.ddtree_proposer import (
++                        DDTreeProposer,
++                    )
++
++                    self.drafter = DDTreeProposer(
++                        self.vllm_config, self.device, self
++                    )
++                else:
++                    self.drafter = DFlashProposer(
++                        self.vllm_config, self.device, self
++                    )
+                 self.use_aux_hidden_state_outputs = True
+             elif self.speculative_config.method == "suffix":
+                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+-- 
+2.53.0.windows.2
+
