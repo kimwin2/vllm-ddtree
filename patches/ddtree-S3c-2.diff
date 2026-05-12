@@ -1,0 +1,140 @@
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 576a307..874512b 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -624,6 +624,46 @@ class TritonAttentionImpl(AttentionImpl):
+ 
+         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+ 
++        # S3c-2 (ddtree): convert the optional per-request tree visibility
++        # mask (bool, [batch, 1+budget, 1+budget]) into the additive
++        # ``qq_bias`` (float, [total_q_tokens, 1+budget]) consumed by the
++        # triton kernel: 0 where allowed, -inf where masked. When the
++        # mask is None (the only case until ddtree_verify_tree=true),
++        # ``qq_bias_tensor`` stays None and the kernel takes its existing
++        # ``USE_QQ_BIAS=False`` branch — byte-identical to before.
++        tree_attention_mask = getattr(
++            attn_metadata, "tree_attention_mask", None
++        )
++        qq_bias_tensor = None
++        if tree_attention_mask is not None:
++            # Bool to additive bias.
++            bias_dtype = query.dtype if query.is_floating_point() else torch.float32
++            neg_inf = torch.finfo(bias_dtype).min
++            qq_bias_tensor = torch.where(
++                tree_attention_mask,
++                torch.zeros((), dtype=bias_dtype, device=tree_attention_mask.device),
++                torch.full(
++                    (), neg_inf, dtype=bias_dtype, device=tree_attention_mask.device
++                ),
++            )
++            # Flatten batch × query into the leading dim expected by the
++            # kernel: shape [total_q_tokens, 1+budget] with stride_0 =
++            # 1+budget. The first 1+budget rows correspond to request 0,
++            # next 1+budget to request 1, etc.
++            qq_bias_tensor = qq_bias_tensor.reshape(
++                -1, qq_bias_tensor.shape[-1]
++            ).contiguous()
++            if qq_bias_tensor.shape[0] != num_actual_tokens:
++                # Defensive: shape mismatch would silently mask wrong
++                # positions. Skip the bias rather than risk it.
++                logger.warning(
++                    "ddtree tree_attention_mask shape %s does not match "
++                    "num_actual_tokens=%d; skipping qq_bias for this call.",
++                    tuple(qq_bias_tensor.shape),
++                    num_actual_tokens,
++                )
++                qq_bias_tensor = None
++
+         unified_attention(
+             q=query[:num_actual_tokens],
+             k=key_cache,
+@@ -655,6 +695,7 @@ class TritonAttentionImpl(AttentionImpl):
+             k_scale_cache=k_scale_cache,
+             v_scale_cache=v_scale_cache,
+             chunk_lookback=self.chunk_lookback,
++            qq_bias=qq_bias_tensor,
+         )
+ 
+         return output
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index 1774f1b..2e65a79 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -208,7 +208,19 @@ def kernel_unified_attention(
+         )
+ 
+     if USE_QQ_BIAS:
+-        qq_bias_row_ptrs = qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
++        # S3c-2 (ddtree): index qq_bias globally by ``query_offset_0`` so
++        # that per-request 2D biases work in batched runs. ``query_pos``
++        # alone is the local position within a request and would alias
++        # rows across requests in the same launch. ``query_offset_0`` is
++        # ``cur_batch_in_all_start_index + query_pos`` — i.e., the
++        # global query token index. There are currently no in-tree
++        # callers that set ``qq_bias`` (it was unused before ddtree), so
++        # this indexing change is safe; new callers must size their
++        # ``qq_bias`` tensor as ``[total_query_tokens, max_query_len]``
++        # and stride ``qq_bias_stride_0 = max_query_len``.
++        qq_bias_row_ptrs = (
++            qq_bias_ptr + query_offset_0[:, None] * qq_bias_stride_0
++        )
+ 
+     loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
+         context_len,
+diff --git a/vllm/v1/spec_decode/ddtree_proposer.py b/vllm/v1/spec_decode/ddtree_proposer.py
+index 2d5bb76..d924378 100644
+--- a/vllm/v1/spec_decode/ddtree_proposer.py
++++ b/vllm/v1/spec_decode/ddtree_proposer.py
+@@ -186,12 +186,15 @@ class DDTreeProposer(DFlashProposer):
+             logger.info(
+                 "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
+                 "verify=tree:%s, dflash_draft_horizon=%d). "
+-                "S1+S2+S3b+S3c-1 path active. "
+-                "drafter runs at horizon=15 internally; propose() returns "
+-                "budget tree-node tokens. NOTE: in S3c-1 the runner still "
+-                "verifies these tokens with non-causal attention (no tree "
+-                "mask). Output tokens will differ from dflash and may not "
+-                "be coherent until S3c-2/3 land.",
++                "S1+S2+S3b+S3c-1+S3c-2 path active. drafter runs at "
++                "horizon=15 internally; propose() returns budget tree-node "
++                "tokens; the visibility mask is attached to target's "
++                "TritonAttentionMetadata.tree_attention_mask and applied "
++                "by the triton kernel as additive qq_bias (-inf for "
++                "masked, 0 for visible). Acceptance is still cumprod "
++                "(tree-follow lands in S3c-3) so acceptance length may "
++                "be similar to dflash; the main S3c-2 signal is "
++                "'output sensible AND mask actually applied'.",
+                 self.ddtree_budget,
+                 self.num_speculative_tokens,
+                 self._ddtree_verify_enabled,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index b9e8a21..b852b91 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -2319,6 +2319,25 @@ class GPUModelRunner(
+                 if builder.supports_update_block_table:
+                     cached_attn_metadata[cache_key] = attn_metadata_i
+ 
++            # S3c-2 (ddtree): attach the drafter's pending tree mask to
++            # the target-side metadata so the triton kernel can apply it
++            # as an additive ``qq_bias``. Only triton metadata exposes
++            # the field; flash_attn metadata (used by the drafter's
++            # forward) lacks it and is left untouched. We set the field
++            # unconditionally (None when no pending mask) to overwrite
++            # any stale value carried by cached metadata. Forward-time
++            # shape check is the safety net for mixed prefill+spec
++            # batches.
++            if (
++                not for_cudagraph_capture
++                and dflash_drafter is not None
++                and hasattr(attn_metadata_i, "tree_attention_mask")
++            ):
++                pending = getattr(
++                    dflash_drafter, "_ddtree_pending_mask", None
++                )
++                attn_metadata_i.tree_attention_mask = pending
++
+             if ubid is None:
+                 assert isinstance(attn_metadata, dict)
+                 attn_metadata_dict = attn_metadata
