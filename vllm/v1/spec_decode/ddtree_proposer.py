@@ -178,30 +178,38 @@ class DDTreeProposer(DFlashProposer):
         # path; S3c will plumb it to the target verify metadata.
         self._ddtree_pending_mask: torch.Tensor | None = None
 
-        stage_tag = "S1+S2+S3b+S3c-1" if self._ddtree_verify_enabled else "S1+S2+S3b"
-        logger.info(
-            "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
-            "verify=tree:%s, dflash_draft_horizon=%d). %s path active. "
-            "verify_tree=%s: %s",
-            self.ddtree_budget,
-            self.num_speculative_tokens,
-            self._ddtree_verify_enabled,
-            self.DFLASH_DRAFT_HORIZON,
-            stage_tag,
-            self._ddtree_verify_enabled,
-            (
+        # NOTE: each branch keeps the stage tag as a literal substring in
+        # the format string so that server.sh's
+        # ``grep "<stage> path active" ddtree_proposer.py`` patch-detection
+        # finds the marker on disk, not just in the runtime log.
+        if self._ddtree_verify_enabled:
+            logger.info(
+                "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
+                "verify=tree:%s, dflash_draft_horizon=%d). "
+                "S1+S2+S3b+S3c-1 path active. "
                 "drafter runs at horizon=15 internally; propose() returns "
                 "budget tree-node tokens. NOTE: in S3c-1 the runner still "
                 "verifies these tokens with non-causal attention (no tree "
                 "mask). Output tokens will differ from dflash and may not "
-                "be coherent until S3c-2/3 land."
-                if self._ddtree_verify_enabled
-                else "drafter and output both at num_speculative_tokens; "
-                "real-logits tree stats logged every "
-                f"{self._DDTREE_LOG_FLUSH_AT} sampled batches; target "
-                "verify path unchanged."
-            ),
-        )
+                "be coherent until S3c-2/3 land.",
+                self.ddtree_budget,
+                self.num_speculative_tokens,
+                self._ddtree_verify_enabled,
+                self.DFLASH_DRAFT_HORIZON,
+            )
+        else:
+            logger.info(
+                "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
+                "verify=tree:%s, dflash_draft_horizon=%d). "
+                "S1+S2+S3b path active: drafter and output both at "
+                "num_speculative_tokens; real-logits tree stats logged "
+                "every %d sampled batches; target verify path unchanged.",
+                self.ddtree_budget,
+                self.num_speculative_tokens,
+                self._ddtree_verify_enabled,
+                self.DFLASH_DRAFT_HORIZON,
+                self._DDTREE_LOG_FLUSH_AT,
+            )
 
     @override
     def initialize_attn_backend(
