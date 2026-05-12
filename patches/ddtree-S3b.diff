@@ -1,0 +1,205 @@
+diff --git a/vllm/v1/spec_decode/ddtree_proposer.py b/vllm/v1/spec_decode/ddtree_proposer.py
+index e60d65c..d18fa13 100644
+--- a/vllm/v1/spec_decode/ddtree_proposer.py
++++ b/vllm/v1/spec_decode/ddtree_proposer.py
+@@ -18,21 +18,29 @@ Staged:
+       support per-request 2D attention masks. Logs a structured
+       capability report and stores the verdict on
+       ``self._has_tree_mask_support``. No runtime behavior change.
+-    * **S3a (this revision)** — purely an *out-of-tree* change:
++    * S3a — purely an *out-of-tree* change:
+       ``TritonAttentionMetadata`` gains an optional ``tree_attention_mask``
+-      field (default ``None``). Nothing in this file changes yet. The
+-      kernel still ignores the field, so when ``None`` (always the
+-      case until S3b/S3c) the forward path is byte-identical. The
+-      probe heuristic from S2 will now flip the target verdict to
+-      ``supports_custom_mask=True`` because the metadata field name
+-      matches our hint keywords — this is the intended S3a signal.
+-    * S3b (future) — drafter attaches a real tree mask to the metadata
+-      for the target verify pass (still no kernel consumption; kernel
+-      will be guarded behind a new ``ddtree_verify_tree`` flag).
+-    * S3c (future) — extend the ``unified_attention`` triton kernel to
+-      apply the mask when present, and flip ``ddtree_verify_tree=true``
+-      to actually use it. This is where token output starts to differ
+-      from dflash.
++      field (default ``None``). The probe verdict from S2 flipped to
++      ``supports_custom_mask=True``. No runtime behavior change.
++    * **S3b (this revision)** — the drafter actually builds a per-request
++      ``[batch, 1+budget, 1+budget]`` bool visibility mask whenever the
++      sampling stride hits, and stashes it on
++      ``self._ddtree_pending_mask``. The tensor lives on GPU and is
++      ready for the runner/kernel to consume. NOBODY READS IT YET:
++      the runner is unchanged, the kernel is unchanged, the metadata
++      field still defaults to ``None`` on every build call. Token
++      output remains byte-identical to dflash. S3b is the data-shape
++      checkpoint: we verify (in the live log) that the mask is the
++      right shape, the right dtype, and built without crashes for the
++      full batch — not just for the single-sample tree we built in S1.
++    * S3c (future) — wire the stashed mask to ``TritonAttentionMetadata``
++      on the target verify pass (runner-side plumbing), extend the
++      ``unified_attention`` triton kernel to apply it, expand the
++      target query to ``1+ddtree_budget`` per request, and replace
++      cumprod acceptance with ``follow_verified_tree``. This is where
++      token output starts to differ from dflash and where the round
++      coupling (mask built at round t for verify at round t+1) is
++      formalized.
+ 
+ Reference: Liran Ringel, Yaniv Romano,
+ "Accelerating Speculative Decoding with Block Diffusion Draft Trees",
+@@ -141,11 +149,17 @@ class DDTreeProposer(DFlashProposer):
+         self._ddtree_agg_top1_mass: float = 0.0
+         self._ddtree_local_argmax_warned: bool = False
+ 
++        # S3b state — built by _ddtree_maybe_build_and_log when the
++        # sampling stride hits. Shape: [batch, 1+budget, 1+budget], bool,
++        # on self.device. Not yet consumed by anything in the runtime
++        # path; S3c will plumb it to the target verify metadata.
++        self._ddtree_pending_mask: torch.Tensor | None = None
++
+         logger.info(
+             "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
+-            "verify=tree:%s). S1+S2 path active: real-logits tree stats "
+-            "every %d sampled requests + backend capability probe at "
+-            "initialize_attn_backend; target verify path unchanged.",
++            "verify=tree:%s). S1+S2+S3b path active: real-logits tree "
++            "stats + backend probe at init + per-batch mask stash "
++            "every %d sampled batches; target verify path unchanged.",
+             self.ddtree_budget,
+             self.num_speculative_tokens,
+             self._ddtree_verify_enabled,
+@@ -443,20 +457,26 @@ class DDTreeProposer(DFlashProposer):
+         return draft_token_ids
+ 
+     def _ddtree_maybe_build_and_log(self, draft_token_ids: torch.Tensor) -> None:
+-        """Build a tree from real logits on a sampled request and aggregate.
+-
+-        Sampling and aggregation policy:
+-          * On every call we increment ``_ddtree_call_counter``.
+-          * Every ``_DDTREE_BUILD_EVERY`` calls, we pick request 0 of the
+-            current batch and compute (a) tree size, (b) max depth,
+-            (c) probability mass on the linear top-1 path. These three
+-            scalars feed an accumulator.
+-          * When the accumulator has ``_DDTREE_LOG_FLUSH_AT`` samples,
+-            one INFO log line is emitted and the accumulator resets.
+-
+-        With the defaults (build_every=8, flush_at=25), one INFO line is
+-        emitted per ~200 drafter calls, which on a realistic stream is
+-        well under one log line per second.
++        """Build a per-batch tree mask, stash it, and aggregate stats.
++
++        Sampling and aggregation policy (unchanged from S1):
++          * Every ``_DDTREE_BUILD_EVERY`` propose() calls we run the
++            tree-build path. The stats accumulator advances by one each
++            time (using the first request of the batch for size/depth/
++            top1-mass) and is flushed to an INFO log line once
++            ``_DDTREE_LOG_FLUSH_AT`` samples have accumulated.
++
++        S3b addition:
++          * On every build cycle we now construct a per-request tree
++            and stack the visibility matrices into a
++            ``[batch, 1+budget, 1+budget]`` bool tensor on
++            ``self.device``. The tensor is stashed at
++            ``self._ddtree_pending_mask`` for later consumption (no
++            consumer in this revision; S3c will plumb it).
++          * Padding rows (when a request's tree has fewer than budget
++            nodes) get an identity entry so that, when the mask is
++            eventually applied, padded query slots only attend to
++            themselves — a benign no-op.
+         """
+         self._ddtree_call_counter += 1
+         if (self._ddtree_call_counter % self._DDTREE_BUILD_EVERY) != 0:
+@@ -480,42 +500,71 @@ class DDTreeProposer(DFlashProposer):
+             # change). Skip silently rather than risk a misleading stat.
+             return
+ 
+-        # Pull one request's slice. detach() is a no-op under inference_mode
+-        # but explicit for clarity.
+-        req_logits = logits.view(batch_size, num_spec, -1)[0].detach()
+-
+-        nti, nd, _parents, _child_maps, _visibility = build_ddtree_tree(
+-            req_logits, budget=self.ddtree_budget
+-        )
+-
+-        size = int(nti.numel())
+-        max_depth = int(nd.max().item()) if nd.numel() else 0
++        logits_per_req = logits.view(batch_size, num_spec, -1)
++        full_size = 1 + self.ddtree_budget
++        per_request_masks: list[torch.Tensor] = []
+ 
+-        # top1_mass = prob(top-1 path) under softmax — proxy for how
+-        # peaked the draft distribution is at each depth. Lower mass =
+-        # more spread = more potential benefit from tree expansion.
+-        f_logits = req_logits.float()
+-        top1_logits = f_logits.max(dim=-1).values
+-        lse = torch.logsumexp(f_logits, dim=-1)
+-        log_top1_path = float((top1_logits - lse).sum().item())
+-        top1_mass = float(torch.tensor(log_top1_path).exp().item())
++        stats_collected = False
++        for req_idx in range(batch_size):
++            req_logits = logits_per_req[req_idx].detach()
++            nti, nd, _parents, _child_maps, visibility = build_ddtree_tree(
++                req_logits, budget=self.ddtree_budget
++            )
++            node_count = int(nti.numel())
++            seen = 1 + node_count
+ 
+-        self._ddtree_agg_n += 1
+-        self._ddtree_agg_size += size
+-        self._ddtree_agg_max_depth += max_depth
+-        self._ddtree_agg_top1_mass += top1_mass
++            # Build [full_size, full_size] mask on CPU, copy to device once.
++            mask_cpu = torch.zeros(
++                (full_size, full_size), dtype=torch.bool
++            )
++            if seen > 0:
++                mask_cpu[:seen, :seen] = visibility
++            # Padding rows: each padding slot only attends to itself
++            # (identity diagonal). Benign because S3c's query expansion
++            # will not address these slots anyway, but keeps the mask
++            # well-formed if a kernel iterates over the full grid.
++            for pad_idx in range(seen, full_size):
++                mask_cpu[pad_idx, pad_idx] = True
++            per_request_masks.append(mask_cpu)
++
++            # Collect aggregate stats from request 0 only (cheap).
++            if not stats_collected:
++                stats_collected = True
++                max_depth = int(nd.max().item()) if nd.numel() else 0
++                f_logits = req_logits.float()
++                top1_logits = f_logits.max(dim=-1).values
++                lse = torch.logsumexp(f_logits, dim=-1)
++                log_top1_path = float((top1_logits - lse).sum().item())
++                top1_mass = float(torch.tensor(log_top1_path).exp().item())
++
++                self._ddtree_agg_n += 1
++                self._ddtree_agg_size += node_count
++                self._ddtree_agg_max_depth += max_depth
++                self._ddtree_agg_top1_mass += top1_mass
++
++        # Stack per-request masks and move once to GPU.
++        mask_batched = torch.stack(per_request_masks, dim=0).to(
++            self.device, non_blocking=True
++        )
++        self._ddtree_pending_mask = mask_batched
+ 
+         if self._ddtree_agg_n >= self._DDTREE_LOG_FLUSH_AT:
+             n = self._ddtree_agg_n
++            non_masked_ratio = float(mask_batched.float().mean().item())
+             logger.info(
+                 "ddtree real-logits: samples=%d avg_size=%.1f "
+-                "avg_max_depth=%.1f avg_top1_mass=%.4f budget=%d N=%d",
++                "avg_max_depth=%.1f avg_top1_mass=%.4f budget=%d N=%d | "
++                "mask_shape=%s dtype=%s non_masked_ratio=%.3f "
++                "(S3b stash; not yet consumed by runner/kernel)",
+                 n,
+                 self._ddtree_agg_size / n,
+                 self._ddtree_agg_max_depth / n,
+                 self._ddtree_agg_top1_mass / n,
+                 self.ddtree_budget,
+                 num_spec,
++                tuple(mask_batched.shape),
++                mask_batched.dtype,
++                non_masked_ratio,
+             )
+             self._ddtree_agg_n = 0
+             self._ddtree_agg_size = 0
