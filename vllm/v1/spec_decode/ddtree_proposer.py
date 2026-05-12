@@ -8,16 +8,22 @@ Staged:
       structurally identical to PR #41703.
     * C1/S0 — built a degenerate tree from chosen tokens. Plumbing check
       only; deprecated by S1.
-    * **S1 (this revision)** — capture the *real* draft logits from
+    * S1 — capture the *real* draft logits from
       ``self.model.compute_logits`` via an override of ``_greedy_sample``,
       build a tree from those logits, and log aggregate tree statistics.
       The returned tokens are still the linear top-1 (= per-position
-      argmax), so the output remains bit-identical to dflash. The
-      difference vs C1 is that the tree is now meaningful — node spread,
-      top-1 path probability mass, etc. give us a real signal for how
-      much benefit C2 (tree verify) could deliver.
-    * C2 (future) — wire the visibility mask into the target verify pass
-      and replace acceptance with ``follow_verified_tree``.
+      argmax), so the output remains bit-identical to dflash.
+    * **S2 (this revision)** — at ``initialize_attn_backend`` time,
+      probe the active target and draft attention backends to determine
+      whether they natively support per-request 2D attention masks
+      (required for the future tree-verify pass). Logs a structured
+      capability report and stores the verdict on
+      ``self._has_tree_mask_support``. No runtime behavior change.
+    * S3 (future) — actual tree verify: expand the target query to
+      ``1+ddtree_budget`` per request, inject the 2D visibility mask
+      into target attention metadata (or fall back when S2 reports no
+      native support), and replace linear-cumprod acceptance with
+      ``follow_verified_tree``.
 
 Reference: Liran Ringel, Yaniv Romano,
 "Accelerating Speculative Decoding with Block Diffusion Draft Trees",
@@ -26,7 +32,9 @@ arXiv:2604.12989, 2026 (MIT).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import dataclasses
+import inspect
+from typing import TYPE_CHECKING, Any
 
 import torch
 from typing_extensions import override
@@ -38,7 +46,24 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.sample.metadata import SamplingMetadata
+
+
+# Names that, if present on the metadata dataclass or in a builder's build
+# signature, indicate that the backend has some form of native mask
+# customization. Heuristic — not a guarantee that the kernel applies an
+# arbitrary 2D mask correctly, but a strong signal that it has a slot
+# we can plumb the tree visibility mask through.
+_MASK_HINT_KEYWORDS = (
+    "custom_mask",
+    "attn_mask",
+    "attention_mask",
+    "tree_mask",
+    "mask_mod",
+    "block_mask",
+    "sdpa_attn_masks",
+)
 
 logger = init_logger(__name__)
 
@@ -85,8 +110,13 @@ class DDTreeProposer(DFlashProposer):
         if budget is None or budget <= 0:
             budget = self.num_speculative_tokens
         self.ddtree_budget: int = int(budget)
-        # C2 will use these; S1 only exercises real-logits tree build.
+        # S3 will use these; S1/S2 only measure.
         self._ddtree_verify_enabled: bool = False
+
+        # S2 state — set by _ddtree_probe_attention_backends() during
+        # initialize_attn_backend. Default False until the probe runs.
+        self._has_tree_mask_support: bool = False
+        self._ddtree_probe_report: dict[str, Any] | None = None
 
         # S1 state.
         self._ddtree_last_logits: torch.Tensor | None = None
@@ -99,14 +129,223 @@ class DDTreeProposer(DFlashProposer):
 
         logger.info(
             "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
-            "verify=tree:%s). S1 path active: tree is built from real "
-            "draft logits and aggregate statistics logged every %d sampled "
-            "requests; target verify path is unchanged.",
+            "verify=tree:%s). S1+S2 path active: real-logits tree stats "
+            "every %d sampled requests + backend capability probe at "
+            "initialize_attn_backend; target verify path unchanged.",
             self.ddtree_budget,
             self.num_speculative_tokens,
             self._ddtree_verify_enabled,
             self._DDTREE_LOG_FLUSH_AT,
         )
+
+    @override
+    def initialize_attn_backend(
+        self,
+        kv_cache_config: "KVCacheConfig",
+        kernel_block_sizes: list[int] | None = None,
+    ) -> None:
+        """Run dflash's base setup, then probe attention backends (S2).
+
+        The probe runs once at startup and writes its findings to
+        ``self._has_tree_mask_support`` plus ``self._ddtree_probe_report``.
+        It does not change any runtime behavior — S3 will read the verdict
+        to decide whether to attempt native tree-mask injection vs fall
+        back to a non-native path.
+        """
+        super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        try:
+            self._ddtree_probe_attention_backends()
+        except Exception as exc:  # pragma: no cover - probe is best-effort
+            logger.warning(
+                "ddtree backend probe failed (silently ignored): %s", exc
+            )
+            self._has_tree_mask_support = False
+            self._ddtree_probe_report = {"error": repr(exc)}
+
+    def _ddtree_probe_attention_backends(self) -> None:
+        """Inspect target & draft attention backends for 2D-mask support.
+
+        Writes ``self._has_tree_mask_support`` based on heuristics that
+        look at:
+          1. Builder class name / module (e.g. flex_attention, flashinfer)
+          2. ``build`` / ``build_for_drafting`` parameter names
+          3. Metadata dataclass field names
+
+        Any field/parameter whose name contains one of the mask hint
+        keywords (``custom_mask``, ``mask_mod``, ``attn_mask``, …) is
+        treated as a positive signal.
+        """
+        target_groups = self._ddtree_target_attn_groups()
+        draft_groups = self._ddtree_draft_attn_groups()
+
+        target_report = self._ddtree_probe_groups("target", target_groups)
+        draft_report = self._ddtree_probe_groups("draft", draft_groups)
+
+        # The actual mask gets attached to the *target* verify pass in S3,
+        # so target-side support is the binding capability. Draft-side is
+        # logged for completeness / future use.
+        self._has_tree_mask_support = bool(
+            target_report.get("supports_custom_mask", False)
+        )
+        self._ddtree_probe_report = {
+            "target": target_report,
+            "draft": draft_report,
+        }
+
+        logger.info(
+            "ddtree backend probe:\n"
+            "  target: %s\n"
+            "  draft : %s\n"
+            "  verdict: tree_mask_support=%s%s",
+            self._ddtree_format_report(target_report),
+            self._ddtree_format_report(draft_report),
+            self._has_tree_mask_support,
+            ""
+            if self._has_tree_mask_support
+            else "  (S3 will need a fallback or backend swap to FlexAttention/FlashInfer)",
+        )
+
+    def _ddtree_target_attn_groups(self) -> list[Any]:
+        """Flatten the runner's target attn_groups across KV cache groups."""
+        runner = getattr(self, "runner", None)
+        if runner is None:
+            return []
+        raw = getattr(runner, "attn_groups", None)
+        if not raw:
+            return []
+        flat: list[Any] = []
+        for entry in raw:
+            if isinstance(entry, list):
+                flat.extend(entry)
+            else:
+                flat.append(entry)
+        return flat
+
+    def _ddtree_draft_attn_groups(self) -> list[Any]:
+        """The drafter's own attn_groups, populated by base.initialize_attn_backend."""
+        groups = getattr(self, "draft_attn_groups", []) or []
+        return list(groups)
+
+    def _ddtree_probe_groups(
+        self, label: str, groups: list[Any]
+    ) -> dict[str, Any]:
+        info: dict[str, Any] = {
+            "label": label,
+            "n_groups": len(groups),
+            "builder_class": None,
+            "builder_module": None,
+            "metadata_class": None,
+            "metadata_fields": [],
+            "build_signature": None,
+            "build_for_drafting_signature": None,
+            "indicators": [],
+            "supports_custom_mask": False,
+        }
+        if not groups:
+            info["error"] = "no attention groups"
+            return info
+
+        # Probe the first group only; backends within a single role are
+        # typically homogeneous for our setup.
+        first = groups[0]
+        try:
+            builder = first.get_metadata_builder()
+        except Exception as exc:
+            info["error"] = f"get_metadata_builder failed: {exc!r}"
+            return info
+
+        builder_cls = type(builder)
+        info["builder_class"] = builder_cls.__name__
+        info["builder_module"] = builder_cls.__module__
+
+        # Module-name heuristic — flex_attention has a rich mask_mod API,
+        # FlashInfer accepts custom_mask in its prefill wrappers.
+        mod_lower = (builder_cls.__module__ or "").lower()
+        if "flex_attention" in mod_lower or "flexattention" in mod_lower:
+            info["indicators"].append("module:flex_attention (mask_mod API)")
+            info["supports_custom_mask"] = True
+        if "flashinfer" in mod_lower:
+            info["indicators"].append("module:flashinfer (custom_mask in prefill)")
+            info["supports_custom_mask"] = True
+
+        # Signature heuristic on build() and build_for_drafting().
+        for method_name in ("build", "build_for_drafting"):
+            method = getattr(builder, method_name, None)
+            if method is None:
+                continue
+            try:
+                sig = inspect.signature(method)
+            except (TypeError, ValueError):
+                continue
+            sig_str = str(sig)
+            info[f"{method_name}_signature"] = sig_str
+            for param_name in sig.parameters:
+                pn = param_name.lower()
+                for hint in _MASK_HINT_KEYWORDS:
+                    if hint in pn:
+                        info["indicators"].append(
+                            f"{method_name} param:{param_name}"
+                        )
+                        info["supports_custom_mask"] = True
+
+        # Metadata class — extract from build()'s return annotation when
+        # available, or from the builder's generic parameter binding.
+        meta_cls = self._ddtree_extract_metadata_class(builder)
+        if meta_cls is not None:
+            info["metadata_class"] = meta_cls.__name__
+            if dataclasses.is_dataclass(meta_cls):
+                fields = [f.name for f in dataclasses.fields(meta_cls)]
+                info["metadata_fields"] = fields
+                for fname in fields:
+                    fn = fname.lower()
+                    for hint in _MASK_HINT_KEYWORDS:
+                        if hint in fn:
+                            info["indicators"].append(
+                                f"metadata field:{fname}"
+                            )
+                            info["supports_custom_mask"] = True
+
+        return info
+
+    @staticmethod
+    def _ddtree_extract_metadata_class(builder: Any) -> type | None:
+        """Best-effort: find the metadata dataclass produced by builder.
+
+        Tries:
+          1. ``builder.build``'s return annotation
+          2. ``builder.__orig_bases__`` generic parameter (M)
+        """
+        method = getattr(builder, "build", None)
+        if method is not None:
+            try:
+                ret = inspect.signature(method).return_annotation
+                if inspect.isclass(ret):
+                    return ret
+            except (TypeError, ValueError):
+                pass
+        # AttentionMetadataBuilder[M] generic — pull M from orig_bases.
+        cls = type(builder)
+        for base in getattr(cls, "__orig_bases__", ()) or ():
+            args = getattr(base, "__args__", ()) or ()
+            for arg in args:
+                if inspect.isclass(arg):
+                    return arg
+        return None
+
+    @staticmethod
+    def _ddtree_format_report(info: dict[str, Any]) -> str:
+        parts = [
+            f"backend={info.get('builder_module', '?')}.{info.get('builder_class', '?')}",
+            f"metadata={info.get('metadata_class', '?')}",
+            f"n_groups={info.get('n_groups', 0)}",
+            f"supports_custom_mask={info.get('supports_custom_mask', False)}",
+        ]
+        indicators = info.get("indicators") or []
+        if indicators:
+            parts.append(f"indicators={indicators}")
+        if "error" in info:
+            parts.append(f"error={info['error']}")
+        return ", ".join(parts)
 
     @override
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
