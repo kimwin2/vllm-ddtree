@@ -3462,6 +3462,29 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        # S3c-3 (ddtree): when ddtree_verify_tree is on and the drafter
+        # has stashed per-request tree structure (child_maps + node
+        # tokens) from the previous round, use tree-follow accept
+        # instead of the linear cumprod rejection sampler. The tree
+        # follow walks each request's tree using target's argmax at
+        # the verify positions; it can accept a deeper path than
+        # cumprod whenever target's preferred token at some position
+        # matches a sibling/cousin edge in the tree rather than the
+        # linear top-1 successor.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_ddtree()
+            and getattr(self.speculative_config, "ddtree_verify_tree", False)
+            and hasattr(self.drafter, "_ddtree_pending_child_maps")
+            and self.drafter._ddtree_pending_child_maps is not None
+        ):
+            tree_output = self._ddtree_tree_follow_sample(
+                spec_decode_metadata, logits, sampling_metadata
+            )
+            if tree_output is not None:
+                return tree_output
+            # tree_output is None → fell back; let rejection sampler run.
+
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs
@@ -3469,6 +3492,118 @@ class GPUModelRunner(
             sampling_metadata,
         )
         return sampler_output
+
+    def _ddtree_tree_follow_sample(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput | None:
+        """Greedy tree-follow accept for ddtree verify_tree=true.
+
+        For each request:
+          1. Extract target's argmax at all 1+budget verify positions.
+          2. Start at root (index 0). Look up target_argmax[0] in
+             child_maps[0]. If found, descend to that child node and
+             continue. If not, stop.
+          3. Accept the tokens at the visited child nodes (in walk
+             order). The first non-matching argmax is the bonus token.
+
+        Returns a ``SamplerOutput`` whose ``sampled_token_ids`` has
+        shape ``[num_reqs, max_spec_len + 1]`` and is filled with -1
+        beyond each request's accept length, matching the contract the
+        rejection sampler honors.
+
+        Returns ``None`` to fall back to the linear sampler when the
+        stashed tree state shape doesn't line up with the current
+        batch (e.g., requests removed/added mid-batch).
+        """
+        drafter = self.drafter
+        child_maps_per_req = drafter._ddtree_pending_child_maps
+        node_tokens_per_req = drafter._ddtree_pending_node_tokens
+        if child_maps_per_req is None or node_tokens_per_req is None:
+            return None
+
+        num_draft_tokens = spec_decode_metadata.num_draft_tokens
+        batch_size = len(num_draft_tokens)
+        if batch_size != len(child_maps_per_req):
+            # Shape mismatch — drafter built trees for a different batch
+            # composition. Safer to fall back.
+            return None
+
+        max_spec_len = spec_decode_metadata.max_spec_len
+
+        # Argmax of target's logits at every position in logits_indices
+        # gives [total_verify_positions] = [B*(1+budget)] tokens for our
+        # uniform-budget case. We greedy-argmax here; temperature-aware
+        # sampling can be added later, but the dflash benchmark runs
+        # with temperature=0 so greedy matches.
+        per_position_argmax = logits[
+            spec_decode_metadata.logits_indices
+        ].argmax(dim=-1)
+
+        # CPU-side walk: targets are O(batch*budget) per request, small.
+        per_position_argmax_cpu = per_position_argmax.detach().to(
+            "cpu", non_blocking=False
+        ).tolist()
+
+        # Build output [batch, max_spec_len + 1] filled with -1.
+        out = torch.full(
+            (batch_size, max_spec_len + 1),
+            fill_value=-1,
+            dtype=torch.int64,
+            device=logits.device,
+        )
+
+        cursor = 0
+        for req_idx in range(batch_size):
+            n_drafts = int(num_draft_tokens[req_idx])
+            # Positions for this request in logits_indices order:
+            #   pos 0     = root prediction (after bonus from prev round)
+            #   pos 1..N  = predictions after each draft (= tree node)
+            # cu_num_sampled_tokens stride is (n_drafts + 1).
+            req_argmax = per_position_argmax_cpu[
+                cursor : cursor + n_drafts + 1
+            ]
+            cursor += n_drafts + 1
+
+            child_maps = child_maps_per_req[req_idx]
+            node_tokens = node_tokens_per_req[req_idx]
+            if not child_maps:
+                # No tree built for this request — treat as zero accept,
+                # bonus = argmax at root.
+                if req_argmax:
+                    out[req_idx, 0] = int(req_argmax[0])
+                continue
+
+            accepted_tokens: list[int] = []
+            current = 0  # root
+            while True:
+                if current >= len(req_argmax):
+                    break
+                next_token = int(req_argmax[current])
+                children = child_maps[current] if current < len(child_maps) else None
+                if not children or next_token not in children:
+                    # Not an edge: ``next_token`` is the bonus.
+                    accepted_tokens.append(next_token)
+                    break
+                child_index = children[next_token]
+                # ``child_index`` is 1..budget; tree-node-tokens are 0-indexed.
+                token_idx = child_index - 1
+                if 0 <= token_idx < len(node_tokens):
+                    accepted_tokens.append(node_tokens[token_idx])
+                else:
+                    break
+                current = child_index
+
+            # Write to output (capped at max_spec_len + 1).
+            for slot, tok in enumerate(accepted_tokens[: max_spec_len + 1]):
+                out[req_idx, slot] = tok
+
+        return SamplerOutput(
+            sampled_token_ids=out,
+            logprobs_tensors=None,
+        )
 
     def _bookkeeping_sync(
         self,

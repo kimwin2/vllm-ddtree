@@ -178,6 +178,19 @@ class DDTreeProposer(DFlashProposer):
         # path; S3c will plumb it to the target verify metadata.
         self._ddtree_pending_mask: torch.Tensor | None = None
 
+        # S3c-3 state — per-request child_maps from build_ddtree_tree,
+        # one list[dict[token_id -> child_node_index]] per request, of
+        # length ``1 + budget``. Consumed by gpu_model_runner's
+        # tree-follow accept when ddtree_verify_tree=true. Populated by
+        # ``_propose_with_tree_expansion`` alongside the mask.
+        self._ddtree_pending_child_maps: (
+            list[list[dict[int, int]]] | None
+        ) = None
+        # Per-request tree node token IDs as a list of python lists, so
+        # the tree-follow accept can map an accepted node index back to
+        # its token. Shape: [batch][budget] (CPU, int).
+        self._ddtree_pending_node_tokens: list[list[int]] | None = None
+
         # NOTE: each branch keeps the stage tag as a literal substring in
         # the format string so that server.sh's
         # ``grep "<stage> path active" ddtree_proposer.py`` patch-detection
@@ -186,15 +199,14 @@ class DDTreeProposer(DFlashProposer):
             logger.info(
                 "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
                 "verify=tree:%s, dflash_draft_horizon=%d). "
-                "S1+S2+S3b+S3c-1+S3c-2 path active. drafter runs at "
-                "horizon=15 internally; propose() returns budget tree-node "
-                "tokens; the visibility mask is attached to target's "
-                "TritonAttentionMetadata.tree_attention_mask and applied "
-                "by the triton kernel as additive qq_bias (-inf for "
-                "masked, 0 for visible). Acceptance is still cumprod "
-                "(tree-follow lands in S3c-3) so acceptance length may "
-                "be similar to dflash; the main S3c-2 signal is "
-                "'output sensible AND mask actually applied'.",
+                "S1+S2+S3b+S3c-1+S3c-2+S3c-3 path active. drafter runs "
+                "at horizon=15 internally; propose() returns budget "
+                "tree-node tokens; the visibility mask is attached to "
+                "target's TritonAttentionMetadata.tree_attention_mask "
+                "and applied by the triton kernel as additive qq_bias; "
+                "accept uses greedy tree-follow over target's argmax at "
+                "each verify position (drafter-stashed child_maps). "
+                "Acceptance length expected > dflash baseline of 3.228.",
                 self.ddtree_budget,
                 self.num_speculative_tokens,
                 self._ddtree_verify_enabled,
@@ -615,6 +627,8 @@ class DDTreeProposer(DFlashProposer):
                 "returning zero-token fallback."
             )
             self._ddtree_pending_mask = None
+            self._ddtree_pending_child_maps = None
+            self._ddtree_pending_node_tokens = None
             return torch.zeros(
                 (batch_size, budget), dtype=torch.int64, device=device
             )
@@ -629,6 +643,8 @@ class DDTreeProposer(DFlashProposer):
                 expected_rows,
             )
             self._ddtree_pending_mask = None
+            self._ddtree_pending_child_maps = None
+            self._ddtree_pending_node_tokens = None
             return torch.zeros(
                 (batch_size, budget), dtype=torch.int64, device=device
             )
@@ -639,9 +655,14 @@ class DDTreeProposer(DFlashProposer):
         # stack and move the outputs to device once.
         node_tokens_list: list[torch.Tensor] = []
         mask_list: list[torch.Tensor] = []
+        # S3c-3: stash per-request child_maps and node-token lists so
+        # the runner's tree-follow accept can walk the tree using
+        # target's posterior at the next verify pass.
+        child_maps_per_req: list[list[dict[int, int]]] = []
+        node_tokens_per_req: list[list[int]] = []
         for req_idx in range(batch_size):
             req_logits = logits_per_req[req_idx].detach()
-            nti, _nd, _parents, _child_maps, visibility = build_ddtree_tree(
+            nti, _nd, _parents, child_maps, visibility = build_ddtree_tree(
                 req_logits, budget=budget
             )
 
@@ -667,6 +688,16 @@ class DDTreeProposer(DFlashProposer):
                 mask_cpu[pad_idx, pad_idx] = True
             mask_list.append(mask_cpu)
 
+            # Normalize child_maps length to ``1 + budget`` (pad with
+            # empty dicts when the tree expanded fewer nodes than
+            # budget; padding nodes have no children, so the walk will
+            # stop at them naturally).
+            cm = list(child_maps)
+            while len(cm) < full_size:
+                cm.append({})
+            child_maps_per_req.append(cm)
+            node_tokens_per_req.append([int(t) for t in nti_padded.tolist()])
+
         node_tokens_cpu = torch.stack(node_tokens_list, dim=0)
         mask_cpu_batched = torch.stack(mask_list, dim=0)
 
@@ -676,6 +707,8 @@ class DDTreeProposer(DFlashProposer):
         self._ddtree_pending_mask = mask_cpu_batched.to(
             device=device, non_blocking=True
         )
+        self._ddtree_pending_child_maps = child_maps_per_req
+        self._ddtree_pending_node_tokens = node_tokens_per_req
 
         # One-line trace per call when verify is on (small set of calls
         # under a benchmark; vllm logger throttles automatically).
