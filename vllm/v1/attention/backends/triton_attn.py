@@ -87,6 +87,21 @@ class TritonAttentionMetadata:
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
 
+    # DDTree S3a: optional per-request tree visibility mask.
+    #
+    # Shape (when present): [batch_size, query_len, query_len], bool.
+    # True means the (row, col) attention entry is allowed; False means
+    # it is masked (will be set to -inf in scores by the kernel).
+    #
+    # S3a-only: the field exists on the metadata so the proposer can
+    # attach a mask without changing the dataclass shape later. The
+    # production ``unified_attention`` kernel does NOT yet consume this
+    # field — when the mask is None (always the case for unmodified
+    # callers), the forward path is byte-identical to before. S3c will
+    # add the kernel-side branch that actually applies the mask when
+    # set, behind a separate ``ddtree_verify_tree`` config flag.
+    tree_attention_mask: torch.Tensor | None = None
+
     @staticmethod
     def compute_mm_prefix_range_tensor(
         mm_prefix_range: dict[int, list[tuple[int, int]]] | None,

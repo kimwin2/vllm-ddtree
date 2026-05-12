@@ -13,17 +13,26 @@ Staged:
       build a tree from those logits, and log aggregate tree statistics.
       The returned tokens are still the linear top-1 (= per-position
       argmax), so the output remains bit-identical to dflash.
-    * **S2 (this revision)** — at ``initialize_attn_backend`` time,
-      probe the active target and draft attention backends to determine
-      whether they natively support per-request 2D attention masks
-      (required for the future tree-verify pass). Logs a structured
+    * S2 — at ``initialize_attn_backend`` time, probe the active target
+      and draft attention backends to determine whether they natively
+      support per-request 2D attention masks. Logs a structured
       capability report and stores the verdict on
       ``self._has_tree_mask_support``. No runtime behavior change.
-    * S3 (future) — actual tree verify: expand the target query to
-      ``1+ddtree_budget`` per request, inject the 2D visibility mask
-      into target attention metadata (or fall back when S2 reports no
-      native support), and replace linear-cumprod acceptance with
-      ``follow_verified_tree``.
+    * **S3a (this revision)** — purely an *out-of-tree* change:
+      ``TritonAttentionMetadata`` gains an optional ``tree_attention_mask``
+      field (default ``None``). Nothing in this file changes yet. The
+      kernel still ignores the field, so when ``None`` (always the
+      case until S3b/S3c) the forward path is byte-identical. The
+      probe heuristic from S2 will now flip the target verdict to
+      ``supports_custom_mask=True`` because the metadata field name
+      matches our hint keywords — this is the intended S3a signal.
+    * S3b (future) — drafter attaches a real tree mask to the metadata
+      for the target verify pass (still no kernel consumption; kernel
+      will be guarded behind a new ``ddtree_verify_tree`` flag).
+    * S3c (future) — extend the ``unified_attention`` triton kernel to
+      apply the mask when present, and flip ``ddtree_verify_tree=true``
+      to actually use it. This is where token output starts to differ
+      from dflash.
 
 Reference: Liran Ringel, Yaniv Romano,
 "Accelerating Speculative Decoding with Block Diffusion Draft Trees",
