@@ -186,12 +186,15 @@ class DDTreeProposer(DFlashProposer):
             logger.info(
                 "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
                 "verify=tree:%s, dflash_draft_horizon=%d). "
-                "S1+S2+S3b+S3c-1 path active. "
-                "drafter runs at horizon=15 internally; propose() returns "
-                "budget tree-node tokens. NOTE: in S3c-1 the runner still "
-                "verifies these tokens with non-causal attention (no tree "
-                "mask). Output tokens will differ from dflash and may not "
-                "be coherent until S3c-2/3 land.",
+                "S1+S2+S3b+S3c-1+S3c-2 path active. drafter runs at "
+                "horizon=15 internally; propose() returns budget tree-node "
+                "tokens; the visibility mask is attached to target's "
+                "TritonAttentionMetadata.tree_attention_mask and applied "
+                "by the triton kernel as additive qq_bias (-inf for "
+                "masked, 0 for visible). Acceptance is still cumprod "
+                "(tree-follow lands in S3c-3) so acceptance length may "
+                "be similar to dflash; the main S3c-2 signal is "
+                "'output sensible AND mask actually applied'.",
                 self.ddtree_budget,
                 self.num_speculative_tokens,
                 self._ddtree_verify_enabled,

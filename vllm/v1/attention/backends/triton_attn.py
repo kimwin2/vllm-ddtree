@@ -624,6 +624,46 @@ class TritonAttentionImpl(AttentionImpl):
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
+        # S3c-2 (ddtree): convert the optional per-request tree visibility
+        # mask (bool, [batch, 1+budget, 1+budget]) into the additive
+        # ``qq_bias`` (float, [total_q_tokens, 1+budget]) consumed by the
+        # triton kernel: 0 where allowed, -inf where masked. When the
+        # mask is None (the only case until ddtree_verify_tree=true),
+        # ``qq_bias_tensor`` stays None and the kernel takes its existing
+        # ``USE_QQ_BIAS=False`` branch — byte-identical to before.
+        tree_attention_mask = getattr(
+            attn_metadata, "tree_attention_mask", None
+        )
+        qq_bias_tensor = None
+        if tree_attention_mask is not None:
+            # Bool to additive bias.
+            bias_dtype = query.dtype if query.is_floating_point() else torch.float32
+            neg_inf = torch.finfo(bias_dtype).min
+            qq_bias_tensor = torch.where(
+                tree_attention_mask,
+                torch.zeros((), dtype=bias_dtype, device=tree_attention_mask.device),
+                torch.full(
+                    (), neg_inf, dtype=bias_dtype, device=tree_attention_mask.device
+                ),
+            )
+            # Flatten batch × query into the leading dim expected by the
+            # kernel: shape [total_q_tokens, 1+budget] with stride_0 =
+            # 1+budget. The first 1+budget rows correspond to request 0,
+            # next 1+budget to request 1, etc.
+            qq_bias_tensor = qq_bias_tensor.reshape(
+                -1, qq_bias_tensor.shape[-1]
+            ).contiguous()
+            if qq_bias_tensor.shape[0] != num_actual_tokens:
+                # Defensive: shape mismatch would silently mask wrong
+                # positions. Skip the bias rather than risk it.
+                logger.warning(
+                    "ddtree tree_attention_mask shape %s does not match "
+                    "num_actual_tokens=%d; skipping qq_bias for this call.",
+                    tuple(qq_bias_tensor.shape),
+                    num_actual_tokens,
+                )
+                qq_bias_tensor = None
+
         unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
@@ -655,6 +695,7 @@ class TritonAttentionImpl(AttentionImpl):
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
+            qq_bias=qq_bias_tensor,
         )
 
         return output

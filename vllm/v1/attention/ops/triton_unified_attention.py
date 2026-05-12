@@ -208,7 +208,19 @@ def kernel_unified_attention(
         )
 
     if USE_QQ_BIAS:
-        qq_bias_row_ptrs = qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+        # S3c-2 (ddtree): index qq_bias globally by ``query_offset_0`` so
+        # that per-request 2D biases work in batched runs. ``query_pos``
+        # alone is the local position within a request and would alias
+        # rows across requests in the same launch. ``query_offset_0`` is
+        # ``cur_batch_in_all_start_index + query_pos`` — i.e., the
+        # global query token index. There are currently no in-tree
+        # callers that set ``qq_bias`` (it was unused before ddtree), so
+        # this indexing change is safe; new callers must size their
+        # ``qq_bias`` tensor as ``[total_query_tokens, max_query_len]``
+        # and stride ``qq_bias_stride_0 = max_query_len``.
+        qq_bias_row_ptrs = (
+            qq_bias_ptr + query_offset_0[:, None] * qq_bias_stride_0
+        )
 
     loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
         context_len,

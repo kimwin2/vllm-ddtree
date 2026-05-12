@@ -2319,6 +2319,25 @@ class GPUModelRunner(
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
 
+            # S3c-2 (ddtree): attach the drafter's pending tree mask to
+            # the target-side metadata so the triton kernel can apply it
+            # as an additive ``qq_bias``. Only triton metadata exposes
+            # the field; flash_attn metadata (used by the drafter's
+            # forward) lacks it and is left untouched. We set the field
+            # unconditionally (None when no pending mask) to overwrite
+            # any stale value carried by cached metadata. Forward-time
+            # shape check is the safety net for mixed prefill+spec
+            # batches.
+            if (
+                not for_cudagraph_capture
+                and dflash_drafter is not None
+                and hasattr(attn_metadata_i, "tree_attention_mask")
+            ):
+                pending = getattr(
+                    dflash_drafter, "_ddtree_pending_mask", None
+                )
+                attn_metadata_i.tree_attention_mask = pending
+
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
