@@ -1,0 +1,190 @@
+diff --git a/tools/summarization_bench.py b/tools/summarization_bench.py
+index b7734ec..dffd1bb 100644
+--- a/tools/summarization_bench.py
++++ b/tools/summarization_bench.py
+@@ -19,13 +19,15 @@ so it works regardless of whether the server is dflash-baseline,
+ ddtree off, or ddtree on. To compare two configurations, run twice
+ against two different server configs and diff the resulting JSON.
+ 
+-Usage:
++Usage (mirrors the dflash.benchmark CLI conventions —
++``--max-new-tokens``, ``--top-p``, ``--top-k``, ``--enable-thinking``,
++``--timeout-s``):
+     python tools/summarization_bench.py \\
+         --base-url http://127.0.0.1:8000 \\
+         --model google/gemma-4-E2B-it \\
+         --data-dir /path/to/dataset_root \\
+-        --max-tokens 512 \\
+-        --temperature 0 \\
++        --max-new-tokens 512 \\
++        --temperature 0 --top-p 1.0 --top-k 1 \\
+         --concurrency 1 \\
+         --output-json /tmp/sum_bench_dflash.json
+ 
+@@ -139,15 +141,28 @@ def send_chat(
+     model: str,
+     messages: list[dict[str, str]],
+     *,
+-    max_tokens: int,
++    max_new_tokens: int,
+     temperature: float,
++    top_p: float,
++    top_k: int,
++    enable_thinking: bool,
+     timeout_s: int,
+ ) -> dict[str, Any]:
++    """Match the JSON body shape used by ``dflash.benchmark._send_vllm``.
++
++    The ``chat_template_kwargs.enable_thinking`` field is a vLLM
++    extension that lets the chat template gate the thinking traces
++    (Qwen3 / DeepSeek style). For Gemma-4 this is a no-op but we
++    include it so the same request shape works across models.
++    """
+     body = {
+         "model": model,
+         "messages": messages,
+-        "max_tokens": max_tokens,
++        "max_tokens": max_new_tokens,
+         "temperature": temperature,
++        "top_p": top_p,
++        "top_k": top_k,
++        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+     }
+     r = requests.post(
+         base_url + "/v1/chat/completions",
+@@ -163,8 +178,11 @@ def run_language(
+     model: str,
+     samples: list[dict[str, Any]],
+     *,
+-    max_tokens: int,
++    max_new_tokens: int,
+     temperature: float,
++    top_p: float,
++    top_k: int,
++    enable_thinking: bool,
+     concurrency: int,
+     timeout_s: int,
+     desc: str = "samples",
+@@ -185,8 +203,11 @@ def run_language(
+         try:
+             resp = send_chat(
+                 base_url, model, messages,
+-                max_tokens=max_tokens,
++                max_new_tokens=max_new_tokens,
+                 temperature=temperature,
++                top_p=top_p,
++                top_k=top_k,
++                enable_thinking=enable_thinking,
+                 timeout_s=timeout_s,
+             )
+             return int(resp.get("usage", {}).get("completion_tokens", 0))
+@@ -258,8 +279,34 @@ def main() -> None:
+         default=None,
+         help=f"Subset of languages to evaluate. Default: all 16 ({', '.join(LANGS)}).",
+     )
+-    p.add_argument("--max-tokens", type=int, default=512)
++    p.add_argument(
++        "--max-new-tokens",
++        type=int,
++        default=512,
++        help="Per-request output token cap. Default 512 (matches the "
++             "SGLang summarization reference). dflash.benchmark uses "
++             "2048 by default for non-summarization tasks.",
++    )
+     p.add_argument("--temperature", type=float, default=0.0)
++    p.add_argument(
++        "--top-p",
++        type=float,
++        default=1.0,
++        help="Nucleus sampling cutoff. Match dflash.benchmark default.",
++    )
++    p.add_argument(
++        "--top-k",
++        type=int,
++        default=1,
++        help="Top-K sampling cutoff. Match dflash.benchmark default (1).",
++    )
++    p.add_argument(
++        "--enable-thinking",
++        action="store_true",
++        help="Forwarded to the chat template via "
++             "``chat_template_kwargs.enable_thinking`` (Qwen3 / DeepSeek). "
++             "Ignored by Gemma-4 templates.",
++    )
+     p.add_argument("--concurrency", type=int, default=1)
+     p.add_argument(
+         "--max-samples-per-lang",
+@@ -267,7 +314,12 @@ def main() -> None:
+         default=None,
+         help="Cap samples per language (default: no cap).",
+     )
+-    p.add_argument("--timeout-s", type=int, default=600)
++    p.add_argument(
++        "--timeout-s",
++        type=int,
++        default=3600,
++        help="Per-request HTTP timeout. Match dflash.benchmark default (3600).",
++    )
+     p.add_argument(
+         "--output-json",
+         default=None,
+@@ -331,8 +383,11 @@ def main() -> None:
+             list(pool.map(
+                 lambda s: send_chat(
+                     base_url, served_id, s["messages"],
+-                    max_tokens=args.max_tokens,
++                    max_new_tokens=args.max_new_tokens,
+                     temperature=args.temperature,
++                    top_p=args.top_p,
++                    top_k=args.top_k,
++                    enable_thinking=args.enable_thinking,
+                     timeout_s=args.timeout_s,
+                 ),
+                 wm_samples,
+@@ -346,8 +401,11 @@ def main() -> None:
+         print(f"[{lang}] {len(per_lang_samples[lang])} samples ...")
+         m = run_language(
+             base_url, served_id, per_lang_samples[lang],
+-            max_tokens=args.max_tokens,
++            max_new_tokens=args.max_new_tokens,
+             temperature=args.temperature,
++            top_p=args.top_p,
++            top_k=args.top_k,
++            enable_thinking=args.enable_thinking,
+             concurrency=args.concurrency,
+             timeout_s=args.timeout_s,
+             desc=f"  {lang}",
+@@ -368,9 +426,15 @@ def main() -> None:
+     print("Summarization Benchmark Results")
+     print(f"  base_url={base_url}  model={served_id}")
+     print(
+-        f"  max_tokens={args.max_tokens}  "
++        f"  max_new_tokens={args.max_new_tokens}  "
+         f"temperature={args.temperature}  "
+-        f"concurrency={args.concurrency}"
++        f"top_p={args.top_p}  top_k={args.top_k}  "
++        f"enable_thinking={args.enable_thinking}"
++    )
++    print(
++        f"  concurrency={args.concurrency}  "
++        f"max_samples_per_lang={args.max_samples_per_lang}  "
++        f"timeout_s={args.timeout_s}"
+     )
+     print("-" * 72)
+     print(f"{'lang':<8}{'accept_len':>14}{'avg_tokens':>14}{'tps':>12}{'n_ok':>10}{'errors':>10}")
+@@ -422,10 +486,14 @@ def main() -> None:
+                         "served_model": served_id,
+                         "data_dir": args.data_dir,
+                         "langs": list(sorted_langs),
+-                        "max_tokens": args.max_tokens,
++                        "max_new_tokens": args.max_new_tokens,
+                         "temperature": args.temperature,
++                        "top_p": args.top_p,
++                        "top_k": args.top_k,
++                        "enable_thinking": args.enable_thinking,
+                         "concurrency": args.concurrency,
+                         "max_samples_per_lang": args.max_samples_per_lang,
++                        "timeout_s": args.timeout_s,
+                         "warmup": args.warmup,
+                     },
+                     "results_per_lang": results,
