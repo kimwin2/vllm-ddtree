@@ -1,0 +1,547 @@
+diff --git a/tools/ddtree_debug.sh b/tools/ddtree_debug.sh
+new file mode 100644
+index 0000000..9fbdc38
+--- /dev/null
++++ b/tools/ddtree_debug.sh
+@@ -0,0 +1,127 @@
++#!/usr/bin/env bash
++#
++# ddtree_debug.sh — server-side log dissection helper for the ddtree
++# integration. Given a vllm server log (default /tmp/vllm-on-s3c1.log),
++# this prints:
++#
++#   1. Detected stage marker
++#   2. Backend probe verdict
++#   3. KV layout audit (S3c-4 one-time INFO)
++#   4. Compaction stats over time (average accepted path length,
++#      copies, dry_run flag) with the most recent N entries
++#   5. spec_decode metric history (if the /metrics endpoint is reachable
++#      on $PORT — defaults to 8000)
++#
++# Each section is independent — feel free to grep, awk, or pipe to
++# `tee` for finer slicing.
++
++set -u
++
++LOG="${1:-/tmp/vllm-on-s3c1.log}"
++PORT="${2:-8000}"
++RECENT_N="${3:-10}"
++
++if [ ! -f "$LOG" ]; then
++  echo "ERROR: log file not found: $LOG"
++  echo "Usage: $0 [log_path] [port] [recent_N]"
++  exit 1
++fi
++
++# ────────────────────────────────────────────────────────────────────
++# 1. Stage marker (S1, S1+S2, ..., S1+S2+S3b+S3c-1+S3c-2+S3c-3+S3c-4)
++# ────────────────────────────────────────────────────────────────────
++echo "===== 1. Active stage marker ====="
++KNOWN_STAGES=(
++  "S1+S2+S3b+S3c-1+S3c-2+S3c-3+S3c-4"
++  "S1+S2+S3b+S3c-1+S3c-2+S3c-3"
++  "S1+S2+S3b+S3c-1+S3c-2"
++  "S1+S2+S3b+S3c-1"
++  "S1+S2+S3b"
++  "S1+S2"
++  "S1"
++)
++STAGE="UNKNOWN"
++for tag in "${KNOWN_STAGES[@]}"; do
++  if grep -q "$tag path active" "$LOG"; then
++    STAGE="$tag"
++    break
++  fi
++done
++echo "  active stage  : $STAGE"
++echo "  verify_tree   : $(grep -oE 'verify=tree:(True|False)' "$LOG" | head -1 | cut -d: -f2)"
++echo "  num_spec      : $(grep -oE 'num_speculative_tokens=[0-9]+' "$LOG" | head -1 | cut -d= -f2)"
++echo "  budget        : $(grep -oE 'budget=[0-9]+' "$LOG" | head -1 | cut -d= -f2)"
++
++# ────────────────────────────────────────────────────────────────────
++# 2. Backend probe verdict
++# ────────────────────────────────────────────────────────────────────
++echo
++echo "===== 2. Backend probe verdict ====="
++grep -nA4 "ddtree backend probe:" "$LOG" | tail -5
++
++# ────────────────────────────────────────────────────────────────────
++# 3. KV layout audit (S3c-4 one-time INFO)
++# ────────────────────────────────────────────────────────────────────
++echo
++echo "===== 3. KV layout audit (S3c-4) ====="
++LAYOUT_BLOCK=$(awk '/ddtree KV layout audit:/{flag=1; print; next} flag && /^\(.*INFO.*\)/{flag=0} flag {print}' "$LOG")
++if [ -n "$LAYOUT_BLOCK" ]; then
++  echo "$LAYOUT_BLOCK"
++else
++  echo "  (no KV layout audit found — server may be pre-S3c-4 or audit not yet logged)"
++fi
++
++# ────────────────────────────────────────────────────────────────────
++# 4. Compaction stats over time
++# ────────────────────────────────────────────────────────────────────
++echo
++echo "===== 4. Compaction history (most recent $RECENT_N) ====="
++COMPACT_LINES=$(grep "ddtree compact:" "$LOG")
++if [ -z "$COMPACT_LINES" ]; then
++  echo "  (no 'ddtree compact:' log lines yet — server may be in OFF mode"
++  echo "   or no traffic ran with verify_tree=true)"
++else
++  TOTAL=$(echo "$COMPACT_LINES" | wc -l)
++  echo "  total compact calls logged : $TOTAL"
++  # Extract avg_K values for histogram-lite summary
++  AVG_KS=$(echo "$COMPACT_LINES" | grep -oE 'avg_K=[0-9.]+' | cut -d= -f2)
++  if [ -n "$AVG_KS" ]; then
++    MIN=$(echo "$AVG_KS" | sort -g | head -1)
++    MAX=$(echo "$AVG_KS" | sort -g | tail -1)
++    SUM=$(echo "$AVG_KS" | awk '{s+=$1} END {print s}')
++    COUNT=$(echo "$AVG_KS" | wc -l)
++    MEAN=$(awk -v s="$SUM" -v c="$COUNT" 'BEGIN {printf "%.3f", s/c}')
++    echo "  avg_K stats                : min=$MIN max=$MAX mean=$MEAN n=$COUNT"
++    echo "  (baseline dflash cumprod: avg_K = 3.228; S3c-4 target: > 3.228)"
++  fi
++  echo
++  echo "  --- most recent ${RECENT_N} compact lines ---"
++  echo "$COMPACT_LINES" | tail -n "$RECENT_N" | sed 's/^/  /'
++fi
++
++# ────────────────────────────────────────────────────────────────────
++# 5. spec_decode metrics (if endpoint reachable)
++# ────────────────────────────────────────────────────────────────────
++echo
++echo "===== 5. spec_decode metrics ====="
++if curl -fs "http://127.0.0.1:$PORT/metrics" >/dev/null 2>&1; then
++  M=$(curl -s "http://127.0.0.1:$PORT/metrics")
++  DRAFTS=$(echo "$M" | grep '^vllm:spec_decode_num_drafts_total' | head -1 | awk '{print $NF}')
++  DRAFT_TOKENS=$(echo "$M" | grep '^vllm:spec_decode_num_draft_tokens_total' | head -1 | awk '{print $NF}')
++  ACCEPTED=$(echo "$M" | grep '^vllm:spec_decode_num_accepted_tokens_total' | head -1 | awk '{print $NF}')
++  if [ -n "${DRAFTS:-}" ] && [ -n "${ACCEPTED:-}" ]; then
++    ACCEPT_PER_DRAFT=$(awk -v a="$ACCEPTED" -v d="$DRAFTS" 'BEGIN{if(d+0>0) printf "%.3f", a/d; else print "n/a"}')
++    echo "  drafts                     : $DRAFTS"
++    echo "  draft_tokens               : $DRAFT_TOKENS"
++    echo "  accepted                   : $ACCEPTED"
++    echo "  accept_len per draft round : $ACCEPT_PER_DRAFT  (baseline 3.228)"
++  fi
++  echo "  per-position accepted counts (first 10):"
++  echo "$M" | grep '^vllm:spec_decode_num_accepted_tokens_per_pos_total' \
++        | head -10 | sed 's/^/    /'
++else
++  echo "  (port $PORT not reachable; pass a different port as the 2nd arg)"
++fi
++
++echo
++echo "Done. log=$LOG  port=$PORT  recent=$RECENT_N"
+diff --git a/vllm/v1/spec_decode/ddtree_proposer.py b/vllm/v1/spec_decode/ddtree_proposer.py
+index cbf540f..b9e554a 100644
+--- a/vllm/v1/spec_decode/ddtree_proposer.py
++++ b/vllm/v1/spec_decode/ddtree_proposer.py
+@@ -199,14 +199,17 @@ class DDTreeProposer(DFlashProposer):
+             logger.info(
+                 "DDTreeProposer enabled (budget=%d, num_speculative_tokens=%d, "
+                 "verify=tree:%s, dflash_draft_horizon=%d). "
+-                "S1+S2+S3b+S3c-1+S3c-2+S3c-3 path active. drafter runs "
+-                "at horizon=15 internally; propose() returns budget "
+-                "tree-node tokens; the visibility mask is attached to "
+-                "target's TritonAttentionMetadata.tree_attention_mask "
+-                "and applied by the triton kernel as additive qq_bias; "
+-                "accept uses greedy tree-follow over target's argmax at "
+-                "each verify position (drafter-stashed child_maps). "
+-                "Acceptance length expected > dflash baseline of 3.228.",
++                "S1+S2+S3b+S3c-1+S3c-2+S3c-3+S3c-4 path active. drafter "
++                "runs at horizon=15 internally; propose() returns "
++                "budget tree-node tokens; the visibility mask is "
++                "attached to target's TritonAttentionMetadata."
++                "tree_attention_mask and applied by the triton kernel "
++                "as additive qq_bias; accept uses greedy tree-follow "
++                "over target's argmax at each verify position; AFTER "
++                "accept the per-request KV cache is compacted so the "
++                "scattered tree-path accepts become a contiguous "
++                "prefix for the next round (S3c-4). Acceptance length "
++                "expected > dflash baseline of 3.228.",
+                 self.ddtree_budget,
+                 self.num_speculative_tokens,
+                 self._ddtree_verify_enabled,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e0b316d..6afe0d4 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -505,6 +505,19 @@ class GPUModelRunner(
+         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
+         # indexes: [kv_cache_group_id][attn_group]
+         self.attn_groups: list[list[AttentionGroup]] = []
++
++        # S3c-4 (ddtree KV slot compaction): runtime state for the
++        # tree-follow accept path. Populated only when ddtree_verify_tree
++        # is on; harmless empty for every other config.
++        # ``_ddtree_kv_caches_by_layer`` is set at the end of
++        # ``initialize_kv_cache_tensors`` so the compaction can find each
++        # layer's KV tensor by layer_name. ``_ddtree_verify_slot_mappings``
++        # is refilled per round in ``_build_attn_group_metadata`` and
++        # consumed by ``_ddtree_compact_kv_cache``.
++        self._ddtree_kv_caches_by_layer: dict[str, torch.Tensor] = {}
++        self._ddtree_verify_slot_mappings: dict[str, torch.Tensor] = {}
++        self._ddtree_compact_call_counter: int = 0
++        self._ddtree_kv_layout_logged: bool = False
+         # self.kv_cache_config: KVCacheConfig
+ 
+         # mm_hash ->  encoder_output
+@@ -2328,6 +2341,11 @@ class GPUModelRunner(
+             # any stale value carried by cached metadata. Forward-time
+             # shape check is the safety net for mixed prefill+spec
+             # batches.
++            #
++            # S3c-4 (ddtree): when the pending mask is present, also
++            # stash this builder's per-layer ``slot_mapping`` so the
++            # tree-follow compaction can locate the KV slots written by
++            # this verify pass for each accepted tree-path node.
+             if (
+                 not for_cudagraph_capture
+                 and dflash_drafter is not None
+@@ -2337,6 +2355,11 @@ class GPUModelRunner(
+                     dflash_drafter, "_ddtree_pending_mask", None
+                 )
+                 attn_metadata_i.tree_attention_mask = pending
++                if pending is not None:
++                    smap = getattr(attn_metadata_i, "slot_mapping", None)
++                    if smap is not None:
++                        for ln in attn_group.layer_names:
++                            self._ddtree_verify_slot_mappings[ln] = smap
+ 
+             if ubid is None:
+                 assert isinstance(attn_metadata, dict)
+@@ -3493,6 +3516,20 @@ class GPUModelRunner(
+         )
+         return sampler_output
+ 
++    # S3c-4 (ddtree): greedy tree-follow accept is now wired to the
++    # per-request KV slot compaction below, so the scattered tree-path
++    # accepts do not poison the next round's drafter context. Flip to
++    # False to fall back to cumprod accept while keeping the mask
++    # plumbing (S3c-2) active.
++    _DDTREE_ENABLE_TREE_FOLLOW: bool = True
++    # S3c-4 (ddtree): set to True to skip the actual KV copy in
++    # compaction (useful for measuring path-stats without changing
++    # downstream behavior; output will be wrong but cheap to inspect).
++    _DDTREE_DRY_RUN_COMPACT: bool = False
++    # S3c-4 (ddtree): emit one INFO summary every N compaction calls.
++    # 0 disables the summary. The first call always logs (regardless).
++    _DDTREE_LOG_COMPACT_EVERY: int = 25
++
+     def _ddtree_tree_follow_sample(
+         self,
+         spec_decode_metadata: SpecDecodeMetadata,
+@@ -3514,10 +3551,28 @@ class GPUModelRunner(
+         beyond each request's accept length, matching the contract the
+         rejection sampler honors.
+ 
+-        Returns ``None`` to fall back to the linear sampler when the
+-        stashed tree state shape doesn't line up with the current
+-        batch (e.g., requests removed/added mid-batch).
++        Returns ``None`` to fall back to the linear sampler when:
++        * ``_DDTREE_ENABLE_TREE_FOLLOW`` is False (current S3c-3-quick
++          state — keeps the acceptance length at the cumprod baseline
++          of 3.228 until S3c-4 adds KV slot compaction).
++        * The stashed tree state shape doesn't line up with the
++          current batch (e.g., requests removed/added mid-batch).
+         """
++        if not self._DDTREE_ENABLE_TREE_FOLLOW:
++            if not getattr(self, "_ddtree_tree_follow_off_warned", False):
++                self._ddtree_tree_follow_off_warned = True
++                logger.info(
++                    "ddtree S3c-3-quick: tree-follow accept is "
++                    "disabled (falls back to cumprod). The drafter's "
++                    "tree mask is still attached and applied by the "
++                    "kernel (S3c-2), so verify-side trees are exercised; "
++                    "only the accept-side tree walk is gated. Set "
++                    "GpuModelRunner._DDTREE_ENABLE_TREE_FOLLOW=True "
++                    "AFTER S3c-4 KV slot compaction is implemented to "
++                    "unlock acceptance length > 3.228 (dflash baseline)."
++                )
++            return None
++
+         drafter = self.drafter
+         child_maps_per_req = drafter._ddtree_pending_child_maps
+         node_tokens_per_req = drafter._ddtree_pending_node_tokens
+@@ -3555,6 +3610,7 @@ class GPUModelRunner(
+             device=logits.device,
+         )
+ 
++        accepted_paths_per_req: list[list[int]] = []
+         cursor = 0
+         for req_idx in range(batch_size):
+             n_drafts = int(num_draft_tokens[req_idx])
+@@ -3569,11 +3625,13 @@ class GPUModelRunner(
+ 
+             child_maps = child_maps_per_req[req_idx]
+             node_tokens = node_tokens_per_req[req_idx]
++            path: list[int] = [0]
+             if not child_maps:
+                 # No tree built for this request — treat as zero accept,
+                 # bonus = argmax at root.
+                 if req_argmax:
+                     out[req_idx, 0] = int(req_argmax[0])
++                accepted_paths_per_req.append(path)
+                 continue
+ 
+             accepted_tokens: list[int] = []
+@@ -3594,17 +3652,245 @@ class GPUModelRunner(
+                     accepted_tokens.append(node_tokens[token_idx])
+                 else:
+                     break
++                path.append(child_index)
+                 current = child_index
+ 
++            accepted_paths_per_req.append(path)
+             # Write to output (capped at max_spec_len + 1).
+             for slot, tok in enumerate(accepted_tokens[: max_spec_len + 1]):
+                 out[req_idx, slot] = tok
+ 
++        # S3c-4 (ddtree): compact KV cache so the scattered accepted
++        # tree-path positions become the next round's contiguous prefix.
++        # Wrapped in try/except so any indexing surprise (e.g., a
++        # surprising slot_mapping shape from a mixed batch) does not
++        # crash serving — it just leaves KV state inconsistent which
++        # the user can recognize via degraded acceptance length.
++        try:
++            stats = self._ddtree_compact_kv_cache(
++                accepted_paths_per_req,
++                spec_decode_metadata,
++                dry_run=self._DDTREE_DRY_RUN_COMPACT,
++            )
++            self._ddtree_compact_call_counter += 1
++            should_log = self._ddtree_compact_call_counter == 1 or (
++                self._DDTREE_LOG_COMPACT_EVERY > 0
++                and self._ddtree_compact_call_counter
++                % self._DDTREE_LOG_COMPACT_EVERY
++                == 0
++            )
++            if should_log:
++                avg_K = sum(
++                    max(len(p) - 1, 0) for p in accepted_paths_per_req
++                ) / max(len(accepted_paths_per_req), 1)
++                paths_repr = ", ".join(
++                    str(p) for p in accepted_paths_per_req[:2]
++                )
++                logger.info(
++                    "ddtree compact: call=%d batch=%d avg_K=%.2f "
++                    "copies=%d skipped=%d dry_run=%s paths_sample=[%s]",
++                    self._ddtree_compact_call_counter,
++                    len(accepted_paths_per_req),
++                    avg_K,
++                    stats.get("copies", 0),
++                    stats.get("skipped", 0),
++                    self._DDTREE_DRY_RUN_COMPACT,
++                    paths_repr,
++                )
++        except Exception as exc:  # pragma: no cover - defensive
++            logger.warning(
++                "ddtree compaction failed; downstream KV may be "
++                "inconsistent for this iteration: %s",
++                exc,
++            )
++
+         return SamplerOutput(
+             sampled_token_ids=out,
+             logprobs_tensors=None,
+         )
+ 
++    def _ddtree_compact_kv_cache(
++        self,
++        accepted_paths: list[list[int]],
++        spec_decode_metadata: SpecDecodeMetadata,
++        dry_run: bool = False,
++    ) -> dict[str, int]:
++        """S3c-4: per-request, per-layer KV slot compaction.
++
++        For each request r with accepted tree path
++        ``[0, c1, c2, ..., cK]`` (root + K visited children) and for
++        each target attention layer, copy the KV at the scattered
++        verify-time slot of node ``ci`` to the contiguous prefix
++        position ``i``. This makes vLLM's standard "first K accepted"
++        contiguous-prefix assumption hold even though tree-follow
++        accepts non-contiguous nodes.
++
++        Locating slots:
++          * ``self._ddtree_verify_slot_mappings[layer]`` is the
++            per-layer ``slot_mapping`` tensor stashed in
++            ``_build_attn_group_metadata`` at the start of this round.
++            Its entries are absolute KV slot indices (block * size +
++            offset) for each query token's KV write.
++          * For request r with budget tree-node draft tokens, the
++            request's slice in ``slot_mapping`` starts at the
++            cumulative query offset computed below.
++          * ``kv_cache[block_id, :, offset, ...]`` holds both K and V
++            (dim 1 is the K/V channel after layout normalization).
++
++        Args:
++            accepted_paths: per-request walk paths
++              (``path[0] = 0`` root, ``path[1..K]`` visited child node
++              indices).
++            spec_decode_metadata: provides ``num_draft_tokens`` per
++              request, used to compute per-request flat query offset.
++            dry_run: when True, count what would be copied without
++              actually mutating the KV tensors. Useful for measuring
++              the path-length distribution without changing the
++              model's downstream behavior. Note: with dry_run=True the
++              accept path still affects the sampler output, so the
++              model trajectory still diverges — pair with
++              ``_DDTREE_ENABLE_TREE_FOLLOW=False`` for a pure shadow
++              measurement.
++
++        Returns:
++            Stats dict with counts: ``requests`` processed,
++            ``copies`` performed (or simulated), ``skipped`` due to
++            shape mismatches or missing state.
++        """
++        stats = {"requests": 0, "copies": 0, "skipped": 0}
++        if not accepted_paths:
++            return stats
++        if not self._ddtree_kv_caches_by_layer:
++            stats["skipped"] += 1
++            return stats
++        if not self._ddtree_verify_slot_mappings:
++            stats["skipped"] += 1
++            return stats
++
++        num_draft_tokens = spec_decode_metadata.num_draft_tokens
++        # Cumulative flat-query offset per request. For a uniformly-
++        # speced batch (e.g., 1 + budget per request), this is just
++        # r * (budget+1); the explicit cumsum handles mixed widths.
++        query_starts: list[int] = []
++        cumsum = 0
++        for r in range(len(num_draft_tokens)):
++            query_starts.append(cumsum)
++            cumsum += num_draft_tokens[r] + 1
++
++        device = self.device
++        warned_local = False
++        for req_idx, path in enumerate(accepted_paths):
++            if req_idx >= len(query_starts):
++                stats["skipped"] += 1
++                continue
++            if len(path) <= 1:
++                # Only root walked; nothing to compact.
++                stats["requests"] += 1
++                continue
++            K = len(path) - 1
++            q_start = query_starts[req_idx]
++
++            src_q_indices = torch.tensor(
++                [q_start + path[i] for i in range(1, K + 1)],
++                dtype=torch.long,
++                device=device,
++            )
++            dst_q_indices = torch.tensor(
++                [q_start + i for i in range(1, K + 1)],
++                dtype=torch.long,
++                device=device,
++            )
++
++            for layer_name, kv_cache in self._ddtree_kv_caches_by_layer.items():
++                slot_mapping = self._ddtree_verify_slot_mappings.get(
++                    layer_name
++                )
++                if slot_mapping is None:
++                    continue
++                if not isinstance(kv_cache, torch.Tensor) or kv_cache.dim() < 3:
++                    continue
++                # After ``_update_hybrid_attention_mamba_layout``, the
++                # attention KV cache shape is
++                # ``[num_blocks, 2, block_size, num_kv_heads, head_dim]``.
++                # block_size is the THIRD dim. Mamba layers don't fit
++                # this shape and are filtered out by the dim check
++                # above OR by the lack of slot_mapping entry.
++                block_size = int(kv_cache.shape[2])
++                if block_size <= 0:
++                    continue
++                try:
++                    src_slots = slot_mapping.index_select(0, src_q_indices)
++                    dst_slots = slot_mapping.index_select(0, dst_q_indices)
++                except (IndexError, RuntimeError) as exc:
++                    stats["skipped"] += 1
++                    if not warned_local:
++                        warned_local = True
++                        logger.warning(
++                            "ddtree compaction: slot_mapping index error "
++                            "in layer %s (likely mixed prefill+spec "
++                            "batch). Skipping further layers for req=%d. "
++                            "%s",
++                            layer_name,
++                            req_idx,
++                            exc,
++                        )
++                    break
++                src_blocks = src_slots // block_size
++                src_offsets = src_slots % block_size
++                dst_blocks = dst_slots // block_size
++                dst_offsets = dst_slots % block_size
++                if dry_run:
++                    stats["copies"] += K
++                    continue
++                # Clone to avoid aliasing if src and dst slot index
++                # tensors share entries.
++                src_view = kv_cache[src_blocks, :, src_offsets].clone()
++                kv_cache[dst_blocks, :, dst_offsets] = src_view
++                stats["copies"] += K
++            stats["requests"] += 1
++
++        return stats
++
++    def _ddtree_log_kv_layout_audit(self) -> None:
++        """One-time INFO dump of KV cache layout for debugging.
++
++        Emits one log block describing each layer's KV cache tensor
++        shape, dtype, device, derived block_size, and the head/dim
++        geometry. The compaction routine relies on the layout
++        ``[num_blocks, 2, block_size, num_kv_heads, head_dim]``; this
++        log surfaces any divergence so a user can diagnose issues
++        without re-running the server with a debugger attached.
++        """
++        if self._ddtree_kv_layout_logged:
++            return
++        if not self._ddtree_kv_caches_by_layer:
++            return
++        self._ddtree_kv_layout_logged = True
++        lines = ["ddtree KV layout audit:"]
++        sample = list(self._ddtree_kv_caches_by_layer.items())[:3]
++        for layer_name, kv_cache in sample:
++            try:
++                shape = tuple(kv_cache.shape)
++                dtype = str(kv_cache.dtype)
++                device = str(kv_cache.device)
++                ndim = kv_cache.dim()
++                block_size = int(kv_cache.shape[2]) if ndim >= 3 else -1
++                kv_channel_dim_size = (
++                    int(kv_cache.shape[1]) if ndim >= 2 else -1
++                )
++            except Exception as exc:  # pragma: no cover - defensive
++                lines.append(f"  {layer_name}: <inspect failed: {exc}>")
++                continue
++            lines.append(
++                f"  {layer_name}: shape={shape} dtype={dtype} "
++                f"device={device} block_size(dim2)={block_size} "
++                f"kv_channel(dim1)={kv_channel_dim_size}"
++            )
++        total = len(self._ddtree_kv_caches_by_layer)
++        if total > len(sample):
++            lines.append(f"  ... (and {total - len(sample)} more layers)")
++        logger.info("\n".join(lines))
++
+     def _bookkeeping_sync(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -7206,6 +7492,14 @@ class GPUModelRunner(
+             self.kv_caches,
+             num_attn_module,
+         )
++
++        # S3c-4 (ddtree): keep a per-layer-name reference so the
++        # compaction routine can locate each layer's KV tensor. We use
++        # a shallow dict copy so reshape/binding modifications later
++        # don't break the reference.
++        self._ddtree_kv_caches_by_layer = dict(kv_caches)
++        self._ddtree_log_kv_layout_audit()
++
+         return kv_caches
+ 
+     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
